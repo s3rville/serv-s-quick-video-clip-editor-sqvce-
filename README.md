@@ -20,3 +20,14 @@ This project uses ffmpeg and gifsicle. I do not own anything, all rights are res
 🪲KNOWN BUGS🪲
 --
 Cropping tool sometimes causes the video preview overlap the program GUI and block your view.
+
+--
+## Credits & Open Source Dependencies
+
+This project relies on the following incredible open-source tools to function:
+
+* **[FFmpeg](https://ffmpeg.org/)** - Used for powerful video and audio processing, converting, and multiplexing.
+* **[Gifsicle](https://github.com/kohler/gifsicle)** - Used for creating, editing, and optimizing high-quality GIF animations.
+* **[HandBrake](https://github.com/handbrake/handbrake)** - Used for efficient, multi-threaded video transcoding and compression.
+
+I'm deeply grateful to the developers and communities behind these tools for making their code freely available!
