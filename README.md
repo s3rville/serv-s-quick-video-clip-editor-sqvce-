@@ -14,3 +14,9 @@ This project uses ffmpeg and gifsicle. I do not own anything, all rights are res
 ------------
 
 <img width="1325" height="853" alt="QuickCut_ta41cEWNp7" src="https://github.com/user-attachments/assets/1c64c7e6-d2e1-4a70-b219-227d6f9f4f35" />
+
+--
+
+🪲KNOWN BUGS🪲
+--
+Cropping tool sometimes causes the video preview overlap the program GUI and block your view.
