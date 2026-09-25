@@ -237,10 +237,10 @@ that has not changed:
 
 ---
 
-## 8. Files in this delivery
+Feature log 1
 
-| File | What it is |
-|------|-----------|
-| `QuickCut_annotated.py` | The original program, comment-only additions, proved AST-identical to the source you gave us. |
-| `QuickCut_DEV_GUIDE.md` | This document. |
-| `test_quickcut_headless.py` | Runnable regression harness (real ffmpeg, offscreen Qt). `python test_quickcut_headless.py [path-to-QuickCut.py]`. |
+- xf tuple grew from 6→7 elements (cw, ch, px, py, pw, ph, bg_color), with xf_color()/DEFAULT_BG helpers so anywhere still holding an old 6-tuple just defaults to black — no persistence layer to migrate, so this was safe.
+- xf_filter() now writes the chosen color into ffmpeg's pad=...:color= instead of hardcoded black, so exports actually render the picked background.
+- New swatch button (self.b_color) added to VideoStage's crop/resize bar, leftmost — opposite end from Cancel/OK. Click opens QColorDialog, live-updates the preview immediately via VideoView.set_bg_color().
+- Commit path: committed signal now carries the color; _ok() fires even if only the color changed (not just geometry); MainWindow.on_stage_commit() folds it into the stored Seg.xf.
+- Live preview: relayout() pushes the pending swatch color to the video widget while editing, and the committed clip's color otherwise.
