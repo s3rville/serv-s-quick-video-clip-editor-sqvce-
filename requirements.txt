@@ -1,0 +1,21 @@
+# QuickCut — Python dependencies
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# QuickCut also needs these NON-pip external tools on PATH (or placed next to QuickCut.py):
+#   ffmpeg / ffprobe   REQUIRED — all cutting, probing, thumbnailing and export goes through them.
+#                       Without ffmpeg the app still launches but shows a warning and most features
+#                       are disabled; without ffprobe, Snap/Precise keyframe-accurate cuts are disabled.
+#                       Download: https://ffmpeg.org/download.html
+#   gifsicle            OPTIONAL — enables true lossy GIF compression. Without it, GIF export still
+#                       works, but "lossy" is only approximated via coarser dithering.
+#                       Download: https://www.lcdf.org/gifsicle/
+
+# --- required ---
+PySide6>=6.6,<7        # Qt 6 bindings: GUI, QtMultimedia playback, QtMultimediaWidgets
+
+# --- optional ---
+# psutil is imported inside a try/except with a working fallback (ctypes on Windows,
+# /proc/meminfo on Linux) — only skip it if you don't mind losing the RAM warning pill on macOS.
+psutil>=5.9; sys_platform == "darwin"
