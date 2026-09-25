@@ -71,7 +71,7 @@ Feature list 🛞❕
 - [x] Presets for Encoding and custom presets
 - [ ] Ability to add Images
 - [ ] Preferences Tab
-- [ ] Choose background/blank color
+- [x] Choose background/blank color
 - [ ] Audio Tab ❔
 - [ ] Support for very long videos in the timeline
 - [ ] [QOL] Focus on playhead when zooming in-out on the timeline
