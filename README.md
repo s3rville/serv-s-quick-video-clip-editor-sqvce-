@@ -8,7 +8,7 @@ I appreciate every help and bugfixes since I don't know how to code at all.
 This project uses ffmpeg and gifsicle. I do not own anything, all rights are reserved to the creators.
 
 -----------------------------------------------
-Description
+Description ⭐
 -
 [OPEN SOURCE] Cut, trim, merge video clips quickly with ease without launching a heavy program. Made for memes, gaming clips and similar basic use cases. Tired of not having a reliable program to do tasks that should take seconds? This is the answer for all of your problems. I made it for myself and everyone else too. Enjoy.
 
@@ -16,7 +16,7 @@ Description
 
 <img width="1325" height="853" alt="QuickCut_ta41cEWNp7" src="https://github.com/user-attachments/assets/1c64c7e6-d2e1-4a70-b219-227d6f9f4f35" />
 
-FAQ
+FAQ ❔
 --
 <details>
 <summary><b>1. Why Should I use this program over X ?</b></summary>
@@ -42,7 +42,7 @@ Or you have a your taskbar/titlebar showing in the video? Crop it out instantly!
 File size too big to share on discord? Compress it real quick with the social media presets! No need to swap between programs, all can be done in a single place without launching a program that takes minutes to load... Ad***e...
 </details>
 
-Feature list
+Feature list 🛞❕
 --
 - [x] Import multiple videos onto the project
 - [x] Lazy cache imported videos in the background for better performance
@@ -109,7 +109,7 @@ Feature list
 
 
 
-## Credits & Open Source Dependencies
+## Credits & Open Source Dependencies 🙏
 
 This project relies on the following incredible open-source tools to function:
 
