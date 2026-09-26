@@ -71,6 +71,8 @@ Feature list 🛞❕
 - [x] Presets for Encoding and custom presets
 - [ ] Ability to add Images
 - [ ] Preferences Tab
+  - [ ] Set default save location
+  - [ ] Set export naming scheme
 - [x] Choose background/blank color
 - [ ] Audio Tab ❔
 - [ ] Support for very long videos in the timeline
@@ -78,8 +80,6 @@ Feature list 🛞❕
 - [ ] Bookmarks/labels
 - [ ] Text Tool
 - [ ] [QOL] Shift click on Export to instantly Export next to the original file
-- [ ] Set default save location
-- [ ] Set export naming scheme
 - [ ] Loop option and loop chosen segment
 - [ ] Multi-Language support
 - [ ] Boost volume
