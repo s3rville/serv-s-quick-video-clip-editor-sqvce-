@@ -69,21 +69,21 @@ Feature list 🛞❕
 - [x] Import/Export and Optimize gifs with Lossygif in the GIF mode
 - [x] Quick share menu after Export
 - [x] Presets for Encoding and custom presets
-- [ ] Ability to add Images
+- [x] Ability to add Images
 - [ ] Preferences Tab
   - [ ] Set default save location
   - [ ] Set export naming scheme
 - [x] Choose background/blank color
 - [ ] Audio Tab ❔
-- [ ] Support for very long videos in the timeline
-- [ ] [QOL] Focus on playhead when zooming in-out on the timeline
+- [x] Support for very long videos in the timeline
+- [x] [QOL] Focus on playhead when zooming in-out on the timeline
 - [ ] Bookmarks/labels
 - [ ] Text Tool
-- [ ] [QOL] Shift click on Export to instantly Export next to the original file
-- [ ] Loop option and loop chosen segment
+- [x] [QOL] Shift click on Export to instantly Export next to the original file
+- [x] Loop option and loop chosen segment
 - [ ] Multi-Language support
-- [ ] Boost volume
-- [ ] Nest/Group clips on the timeline
+- [x] Boost volume
+- [x] Nest/Group clips on the timeline
 
 
 <details>
@@ -104,7 +104,8 @@ Feature list 🛞❕
 
 🪲KNOWN BUGS🪲
 --
-- Cropping tool sometimes causes the video preview overlap the program GUI and block your view.
+- Cropping tool sometimes is previewed/displayed wrong
+- Sometimes images display an Error but no symptoms, ignore for now
 - ?
 
 
