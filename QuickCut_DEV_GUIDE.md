@@ -1,3 +1,6 @@
+# OUTDATED 27 september 2026
+
+
 # QuickCut — Developer Guide
 
 Companion to `QuickCut_annotated.py` (the same program with ~160 review comments added inline —
