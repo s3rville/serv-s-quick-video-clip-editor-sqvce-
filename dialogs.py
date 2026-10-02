@@ -27,7 +27,7 @@ import subprocess
 from PySide6.QtCore import (Qt, QUrl, QTimer, QObject, Signal, QRectF, QPointF, QLineF,
                             QSize, QMimeData, QThread, QPoint, QEvent, QRect, QSizeF, QSettings,
                             QVariantAnimation, QEasingCurve)
-from PySide6.QtGui import (QAction, QColor, QPainter, QPen, QPixmap, QIcon, QPalette, QFont,
+from PySide6.QtGui import (QLinearGradient, QAction, QColor, QPainter, QPen, QPixmap, QIcon, QPalette, QFont,
                            QPolygonF, QKeySequence, QShortcut, QPainterPath, QRegion, QIntValidator,
                            QCursor, QDesktopServices, QTransform, QDrag)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -309,15 +309,22 @@ class ClipOptionsDialog(QDialog):
         aud_lay.addWidget(QLabel("Volume"))
         vol_row = QHBoxLayout()
         self.vol_slider = DblSlider(Qt.Orientation.Horizontal)
-        self.vol_slider.setRange(-20, 20)
-        self.vol_slider.setValue(int(round(vol_db)))
+        self.vol_slider.setRange(-20, 20)       # [51.6] slider back to +-20 dB; the spin box beside it has no such limit
+        self.vol_slider.setValue(max(-20, min(20, int(round(vol_db)))))
         self.vol_slider.setEnabled(has_audio)
         self.vol_slider.setToolTip("Double-click to reset to +0 dB")
-        self.vol_label = QLabel()
-        self.vol_label.setFixedWidth(52)
-        self.vol_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        # [FEATURE 51.3] Type any gain in dB - beyond the slider's range too (slider just pins at its end).
+        self.vol_spin = QDoubleSpinBox()
+        self.vol_spin.setRange(-200.0, 200.0)
+        self.vol_spin.setDecimals(1)
+        self.vol_spin.setSingleStep(1.0)
+        self.vol_spin.setSuffix(" dB")
+        self.vol_spin.setFixedWidth(84)
+        self.vol_spin.setEnabled(has_audio)
+        self.vol_spin.setKeyboardTracking(False)
+        self.vol_spin.setValue(float(vol_db))
         vol_row.addWidget(self.vol_slider, 1)
-        vol_row.addWidget(self.vol_label)
+        vol_row.addWidget(self.vol_spin)
         aud_lay.addLayout(vol_row)
 
         type_row = QHBoxLayout()
@@ -343,8 +350,8 @@ class ClipOptionsDialog(QDialog):
         self.slider.doubleClicked.connect(lambda: self.spin.setValue(1.0))
         self.spin.valueChanged.connect(self._on_spin)
         self.vol_slider.valueChanged.connect(self._on_vol)
+        self.vol_spin.valueChanged.connect(self._on_vol_spin)
         self.vol_slider.doubleClicked.connect(lambda: self.vol_slider.setValue(0))
-        self._on_vol(self.vol_slider.value())
         b_reset.clicked.connect(self._reset)
         b_c.clicked.connect(self.reject)
         b_ok.clicked.connect(self.accept)
@@ -370,7 +377,14 @@ class ClipOptionsDialog(QDialog):
         self.slider.blockSignals(False)
 
     def _on_vol(self, val):
-        self.vol_label.setText(f"{val:+d} dB")
+        self.vol_spin.blockSignals(True)
+        self.vol_spin.setValue(float(val))
+        self.vol_spin.blockSignals(False)
+
+    def _on_vol_spin(self, val):
+        self.vol_slider.blockSignals(True)
+        self.vol_slider.setValue(int(round(max(-20.0, min(20.0, val)))))
+        self.vol_slider.blockSignals(False)
 
     def _reset(self):
         self.spin.setValue(1.0)
@@ -380,13 +394,14 @@ class ClipOptionsDialog(QDialog):
         for i in range(self.tracks.count()):
             self.tracks.item(i).setCheckState(Qt.CheckState.Checked)
         self.vol_slider.setValue(0)
+        self.vol_spin.setValue(0.0)
         self.track_type.setCurrentIndex(0)
 
     def values(self):
         atracks = tuple(self.tracks.item(i).checkState() == Qt.CheckState.Checked for i in range(self.tracks.count()))
         track_type = "mono" if self.track_type.currentIndex() == 1 else "stereo"
         return (self.mute.isChecked(), round(self.spin.value(), 2), self.mirror.isChecked(), self.rev.isChecked(),
-                atracks, float(self.vol_slider.value()), track_type)
+                atracks, round(float(self.vol_spin.value()), 2), track_type)
 
 
 # ----------------------------------------------------------------------------- custom title bar
@@ -814,23 +829,21 @@ class TitleBar(QFrame):
         lay.setContentsMargins(12, 0, 0, 0)
         lay.setSpacing(0)
         self.mode_btns = {}
-        grp = QButtonGroup(self)
+        grp = self._grp = QButtonGroup(self)
         grp.setExclusive(True)
         for name in ("Video", "GIF"):
             b = QPushButton(name)
             b.setCheckable(True)
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.setFixedHeight(24)
-            b.setStyleSheet("QPushButton{background:transparent;border:1px solid transparent;border-radius:3px;"
-                            "padding:0 16px;font-weight:700;color:#9a9a9a;}"
-                            "QPushButton:hover:!checked{background:#2e2e2e;color:#e0e0e0;}"
-                            "QPushButton:checked{background:#2d8ceb;color:#ffffff;}")
+            b.setStyleSheet(self._tab_qss())
             b.clicked.connect(lambda _=False, n=name: window.request_mode(n))
             grp.addButton(b)
             lay.addWidget(b)
             lay.addSpacing(4)
             self.mode_btns[name] = b
         self.mode_btns["Video"].setChecked(True)
+        self._lay, self._plug_at, self.plug_tabs = lay, lay.count(), []
         lay.addStretch(1)
         self.min_btn = self._btn("win_min", "Minimize", window.showMinimized)
         self.max_btn = self._btn("win_max", "Maximize", window.toggle_maximize)
@@ -839,6 +852,50 @@ class TitleBar(QFrame):
         for b in (self.min_btn, self.max_btn, self.close_btn):
             lay.addWidget(b)
         self._drag_pos = None
+        # project name: small grey label centred in the bar (same row as the Video / GIF tabs); mouse-transparent
+        self.name_label = QLabel(APP_NAME, self)
+        self.name_label.setStyleSheet("color:#6f6f6f;font-size:8pt;background:transparent;")
+        self.name_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.name_label.adjustSize()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        nl = self.name_label
+        nl.move((self.width() - nl.width()) // 2, (self.height() - nl.height()) // 2)
+
+    def _tab_qss(self):
+        return ("QPushButton{background:transparent;border:1px solid transparent;border-radius:3px;"
+                "padding:0 16px;font-weight:700;color:#9a9a9a;}"
+                "QPushButton:hover:!checked{background:#2e2e2e;color:#e0e0e0;}"
+                f"QPushButton:checked{{background:{theme_map()['accent']};color:#ffffff;}}")
+
+    def restyle(self):
+        for b in list(self.mode_btns.values()) + self.plug_tabs:
+            b.setStyleSheet(self._tab_qss())
+
+    def add_tab(self, name, slot):
+        """[52.0] Mod tab button (same look/group as Video / GIF)."""
+        b = QPushButton(name)
+        b.setCheckable(True)
+        b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        b.setFixedHeight(24)
+        b.setStyleSheet(self._tab_qss())
+        b.clicked.connect(lambda _=False: slot())
+        self._grp.addButton(b)
+        self._lay.insertWidget(self._plug_at + 2 * len(self.plug_tabs), b)
+        self._lay.insertSpacing(self._plug_at + 2 * len(self.plug_tabs) + 1, 4)
+        self.plug_tabs.append(b)
+        return b
+
+    def remove_tab(self, b):
+        i = self._lay.indexOf(b)
+        self._grp.removeButton(b)
+        self._lay.removeWidget(b)
+        if i >= 0 and self._lay.itemAt(i) is not None and self._lay.itemAt(i).spacerItem() is not None:
+            self._lay.takeAt(i)
+        self.plug_tabs.remove(b)
+        b.deleteLater()
+        self.mode_btns["Video" if self.win.app_mode == "Video" else "GIF"].setChecked(True)
 
     def set_mode(self, name):
         self.mode_btns[name].setChecked(True)
@@ -872,3 +929,335 @@ class TitleBar(QFrame):
             self.win.toggle_maximize()
 
 
+
+
+# ----------------------------------------------------------------------------- Preferences
+# [FEATURE v52.0] Tabs: General (default export folder + file naming scheme), Keybinds (every binding, see utils.KEYBIND_DEFS),
+# Interface (theme colours), Plug-ins (mods list), Credits. Footer: RESET (left, asks to confirm) | OK / Cancel / Apply (right).
+# Settings are stored via utils.prefs() (pref_* keys); Apply/OK call parent.apply_prefs() (theme + keybinds + mods reload).
+class PreferencesDialog(QDialog):
+    PAGES = ("General", "Keybinds", "Interface", "Plug-ins", "Credits")
+    PREF_KEYS = ("pref_export_dir_on", "pref_export_dir", "pref_name_scheme", "pref_keybinds", "pref_theme", "pref_mods_on", "pref_mods_off", "pref_mods_order")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from PySide6.QtWidgets import QStackedWidget
+        self.win = parent
+        self.setWindowTitle("Preferences - " + APP_NAME)
+        self.resize(780, 540)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        body = QHBoxLayout()
+        body.setSpacing(0)
+        self.tabs = QListWidget()
+        self.tabs.setFixedWidth(160)
+        self.tabs.setStyleSheet("QListWidget{background:#1a1a1a;border:none;border-right:1px solid #101010;outline:0;}"
+                                "QListWidget::item{padding:9px 14px;color:#b8b8b8;}"
+                                "QListWidget::item:hover{background:#2a2a2a;}"
+                                f"QListWidget::item:selected{{background:{theme_map()['accent']};color:#ffffff;}}")
+        self.stack = QStackedWidget()
+        self.theme_cur = {}
+        for name in self.PAGES:
+            self.tabs.addItem(name)
+            self.stack.addWidget(getattr(self, "_pg_" + name.lower().replace("-", ""))())
+        self.tabs.currentRowChanged.connect(self.stack.setCurrentIndex)
+        body.addWidget(self.tabs)
+        body.addWidget(self.stack, 1)
+        root.addLayout(body, 1)
+        foot = QFrame()
+        foot.setObjectName("controlbar")
+        fl = QHBoxLayout(foot)
+        fl.setContentsMargins(10, 8, 10, 8)
+        b_reset = QPushButton("RESET")
+        b_reset.setToolTip("Reset every preference to its default (asks first)")
+        b_reset.setStyleSheet("QPushButton{color:#ff8a80;font-weight:700;}")
+        b_reset.clicked.connect(self._reset)
+        fl.addWidget(b_reset)
+        fl.addStretch(1)
+        b_ok, b_cancel, b_apply = QPushButton("OK"), QPushButton("CANCEL"), QPushButton("APPLY")
+        b_ok.setObjectName("primary")
+        b_ok.clicked.connect(lambda: self._apply() and self.accept())
+        b_cancel.clicked.connect(self.reject)
+        b_apply.clicked.connect(self._apply)
+        for b in (b_ok, b_cancel, b_apply):
+            b.setAutoDefault(False)
+            fl.addWidget(b)
+        root.addWidget(foot)
+        self.tabs.setCurrentRow(0)
+        self._load()
+
+    def _wrap(self, title):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(20, 16, 20, 16)
+        h = QLabel(title)
+        h.setStyleSheet("font-size:13pt;font-weight:700;color:#ffffff;")
+        v.addWidget(h)
+        return w, v
+
+    @staticmethod
+    def _dim(text):
+        l = QLabel(text)
+        l.setWordWrap(True)
+        l.setStyleSheet("color:#8f8f8f;")
+        return l
+
+    # ---- pages
+    def _pg_general(self):
+        w, v = self._wrap("General")
+        self.ex_on = QCheckBox("Use a default export location")
+        v.addWidget(self.ex_on)
+        row = QHBoxLayout()
+        self.ex_dir = QLineEdit()
+        self.ex_dir.setPlaceholderText("Folder the Export dialog opens in")
+        self.ex_browse = QPushButton("Browse...")
+
+        def browse():
+            d = QFileDialog.getExistingDirectory(self, "Default export folder", self.ex_dir.text() or os.path.expanduser("~"))
+            if d:
+                self.ex_dir.setText(d)
+        self.ex_browse.clicked.connect(browse)
+        row.addWidget(self.ex_dir, 1)
+        row.addWidget(self.ex_browse)
+        v.addLayout(row)
+        self.ex_on.toggled.connect(lambda on: (self.ex_dir.setEnabled(on), self.ex_browse.setEnabled(on)))
+        v.addWidget(self._dim("Shift+click on Export ignores this and saves next to the source file (edit1, edit2...)."))
+        v.addSpacing(14)
+        h = QLabel("File naming scheme")
+        h.setStyleSheet("font-weight:700;color:#eaeaea;")
+        v.addWidget(h)
+        self.scheme = QLineEdit()
+        v.addWidget(self.scheme)
+        tk = QHBoxLayout()
+        for tok, desc in NAME_TOKENS:
+            b = QToolButton()
+            b.setText(tok)
+            b.setToolTip(desc)
+            b.clicked.connect(lambda _=False, t=tok: (self.scheme.insert(t), self.scheme.setFocus()))
+            tk.addWidget(b)
+        tk.addStretch(1)
+        v.addLayout(tk)
+        self.scheme_prev = self._dim("")
+        v.addWidget(self.scheme_prev)
+        self.scheme.textChanged.connect(self._scheme_preview)
+        v.addWidget(self._dim("Tokens: " + "   ".join(f"{t} = {d}" for t, d in NAME_TOKENS) +
+                              ".\nAdd your own text, hyphens (-) and underscores (_) between the % tokens. The extension "
+                              "is added automatically; characters Windows disallows become '_'. Random tokens change on every export."))
+        v.addStretch(1)
+        return w
+
+    def _scheme_preview(self, _=None):
+        p = format_out_name(self.scheme.text(), "C:/Videos/holiday.mp4", ".mp4", "", "Video")
+        self.scheme_prev.setText("Preview:  " + p)
+
+    def _pg_keybinds(self):
+        from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QKeySequenceEdit, QHeaderView
+        w, v = self._wrap("Keybinds")
+        v.addWidget(self._dim("Click a shortcut box and press the new key combination. Duplicates are highlighted."))
+        self.kt = QTableWidget(len(KEYBIND_DEFS), 3)
+        self.kt.setHorizontalHeaderLabels(["Action", "Shortcut", ""])
+        self.kt.verticalHeader().hide()
+        self.kt.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.kt.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        hh = self.kt.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.kt.setColumnWidth(1, 170)
+        self.kt.setColumnWidth(2, 64)
+        self.key_edits = {}
+        for r, (kid, label, dflt) in enumerate(KEYBIND_DEFS):
+            self.kt.setItem(r, 0, QTableWidgetItem(label))
+            ed = QKeySequenceEdit()
+            try:
+                ed.setMaximumSequenceLength(1)
+            except Exception:
+                pass
+            ed.editingFinished.connect(self._check_conflicts)
+            self.kt.setCellWidget(r, 1, ed)
+            rb = QPushButton("Default")
+            rb.setStyleSheet("padding:2px 6px;")
+            rb.clicked.connect(lambda _=False, e=ed, d=dflt: (e.setKeySequence(QKeySequence(d)), self._check_conflicts()))
+            self.kt.setCellWidget(r, 2, rb)
+            self.key_edits[kid] = ed
+        v.addWidget(self.kt, 1)
+        return w
+
+    def _check_conflicts(self):
+        seen, dup = {}, set()
+        for k, e in self.key_edits.items():
+            s = e.keySequence().toString()
+            if s:
+                if s in seen:
+                    dup |= {k, seen[s]}
+                seen[s] = k
+        for k, e in self.key_edits.items():
+            e.setStyleSheet("border:1px solid #e0413a;" if k in dup else "")
+        return dup
+
+    def _pg_interface(self):
+        w, v = self._wrap("Interface")
+        v.addWidget(self._dim("Pick the program's colours. Applied with Apply / OK. (The timeline's clip and playhead "
+                              "colours are fixed.)"))
+        self.swatches = {}
+        for k, label in THEME_LABELS.items():
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label), 1)
+            b = QPushButton()
+            b.setFixedSize(90, 24)
+            b.clicked.connect(lambda _=False, k=k: self._pick_color(k))
+            row.addWidget(b)
+            rb = QToolButton()
+            rb.setText("\u21ba")
+            rb.setToolTip("Reset to default (" + THEME_DEFAULTS[k] + ")")
+            rb.setFixedSize(24, 24)
+            rb.clicked.connect(lambda _=False, k=k: self._set_swatch(k, THEME_DEFAULTS[k]))
+            row.addWidget(rb)
+            v.addLayout(row)
+            self.swatches[k] = b
+        v.addStretch(1)
+        return w
+
+    def _set_swatch(self, k, col):
+        self.theme_cur[k] = col
+        self.swatches[k].setStyleSheet(f"QPushButton{{background:{col};border:1px solid #888;}}")
+        self.swatches[k].setText(col)
+
+    def _pick_color(self, k):
+        c = QColorDialog.getColor(QColor(self.theme_cur[k]), self, THEME_LABELS[k])
+        if c.isValid():
+            self._set_swatch(k, c.name())
+
+    def _pg_plugins(self):
+        w, v = self._wrap("Plug-ins")
+        v.addWidget(self._dim("Scripts (.py) found in the program's \"mods\" folder. A mod is a \"tool\" (icon in the tool "
+                              "row; several share one stacked button), a \"mode\" (a tab next to Video / GIF) or a \"tab\" (a window like "
+                              "Project). New scripts are OFF: nothing is loaded until you tick it and press Apply / OK. Mods run "
+                              "with full permissions - only enable scripts you trust. Unticking a loaded mod removes it, but a "
+                              "restart is needed to fully unload its code."))
+        self.mod_list = QListWidget()
+        v.addWidget(self.mod_list, 1)
+        row = QHBoxLayout()
+        b1, b2 = QPushButton("Open mods folder"), QPushButton("Rescan")
+        b1.clicked.connect(lambda: (os.makedirs(MODS_DIR, exist_ok=True), QDesktopServices.openUrl(QUrl.fromLocalFile(MODS_DIR))))
+        b2.clicked.connect(self._fill_mods)
+        row.addWidget(b1)
+        row.addWidget(b2)
+        for txt, d, tip in (("\u25B2", -1, "Move the selected plug-in up"), ("\u25BC", 1, "Move the selected plug-in down")):
+            bm = QPushButton(txt)                       # [52.23] load order: tool-stack / Z-cycle order, tab + mode order
+            bm.setFixedWidth(36)
+            bm.setToolTip(tip + " (press Apply / OK to use the new order)")
+            bm.clicked.connect(lambda _=False, d=d: self._move_mod(d))
+            row.addWidget(bm)
+        row.addStretch(1)
+        v.addLayout(row)
+        return w
+
+    def _move_mod(self, d):
+        r = self.mod_list.currentRow()
+        if r < 0 or not 0 <= r + d < self.mod_list.count():
+            return
+        it = self.mod_list.takeItem(r)                  # keeps its check state + data
+        self.mod_list.insertItem(r + d, it)
+        self.mod_list.setCurrentRow(r + d)
+
+    def _fill_mods(self):
+        import plugins as _pl
+        on = set(pref_json("pref_mods_on", []))
+        if self.mod_list.count():                       # keep unsaved checkbox state across a rescan
+            on = {self.mod_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.mod_list.count())
+                  if self.mod_list.item(i).checkState() == Qt.CheckState.Checked}
+        loaded = getattr(self.win, "plugins", None).loaded if self.win is not None and hasattr(self.win, "plugins") else {}
+        keep = [self.mod_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.mod_list.count())]   # unsaved order
+        mods = _pl.scan_mods()
+        if keep:
+            mods.sort(key=lambda m: keep.index(m.file) if m.file in keep else len(keep))
+        self.mod_list.clear()
+        for m in mods:
+            it = QListWidgetItem(f"{m.name}   [{m.type}]   -   {m.file}" + ("   (loaded)" if m.file in loaded else "")
+                                 + (f"   (ERROR: {m.error})" if m.error else ""))
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Checked if m.file in on else Qt.CheckState.Unchecked)
+            it.setData(Qt.ItemDataRole.UserRole, m.file)
+            it.setToolTip((m.desc or "No description") + (f"\nBy {m.author}" if m.author else ""))
+            self.mod_list.addItem(it)
+
+    def _pg_credits(self):
+        w, v = self._wrap("Credits")
+        a = theme_map()["accent"]
+        lab = QLabel(
+            f"<p><b>{APP_NAME}</b></p>"
+            f"<p>Author: <a style='color:{a}' href='https://github.com/s3rville/serv-s-quick-video-clip-editor-sqvce-/tree/main'>serville</a></p>"
+            "<p>Prepared with the help of the Claude</p>"
+            "<p>Built on:</p><ul>"
+            f"<li><a style='color:{a}' href='https://ffmpeg.org/'>FFmpeg</a></li>"
+            f"<li><a style='color:{a}' href='https://github.com/kohler/gifsicle'>Gifsicle</a></li>"
+            f"<li><a style='color:{a}' href='https://github.com/handbrake/handbrake'>HandBrake</a></li></ul>")
+        lab.setTextFormat(Qt.TextFormat.RichText)
+        lab.setOpenExternalLinks(True)
+        lab.setAlignment(Qt.AlignmentFlag.AlignTop)
+        v.addWidget(lab, 1)
+        return w
+
+    # ---- load / save / apply / reset
+    def _load(self):
+        s = prefs()
+        self.ex_on.setChecked(s.value("pref_export_dir_on", False, bool))
+        self.ex_dir.setText(s.value("pref_export_dir", "", str))
+        self.ex_dir.setEnabled(self.ex_on.isChecked())
+        self.ex_browse.setEnabled(self.ex_on.isChecked())
+        self.scheme.setText(name_scheme())
+        self._scheme_preview()
+        km = keybind_map()
+        for k, e in self.key_edits.items():
+            e.setKeySequence(QKeySequence(km[k]))
+        self._check_conflicts()
+        for k, c in theme_map().items():
+            self._set_swatch(k, c)
+        self.mod_list.clear()
+        self._fill_mods()
+
+    def _apply(self):
+        if self._check_conflicts():
+            QMessageBox.warning(self, "Keybinds", "Two actions share the same shortcut (highlighted in red). Change one first.")
+            return False
+        s = prefs()
+        s.setValue("pref_export_dir_on", self.ex_on.isChecked())
+        s.setValue("pref_export_dir", self.ex_dir.text().strip())
+        s.setValue("pref_name_scheme", self.scheme.text().strip() or DEFAULT_SCHEME)
+        norm = lambda t: QKeySequence(t).toString()
+        s.setValue("pref_keybinds", json.dumps({k: e.keySequence().toString() for (k, _, d), e in
+                                                zip(KEYBIND_DEFS, self.key_edits.values()) if e.keySequence().toString() != norm(d)}))
+        s.setValue("pref_theme", json.dumps({k: c for k, c in self.theme_cur.items() if c.lower() != THEME_DEFAULTS[k]}))
+        s.setValue("pref_mods_on", json.dumps([self.mod_list.item(i).data(Qt.ItemDataRole.UserRole)
+                                               for i in range(self.mod_list.count())
+                                               if self.mod_list.item(i).checkState() == Qt.CheckState.Checked]))
+        s.setValue("pref_mods_order", json.dumps([self.mod_list.item(i).data(Qt.ItemDataRole.UserRole)
+                                                  for i in range(self.mod_list.count())]))
+        s.sync()
+        self._run_apply()
+        return True
+
+    def _run_apply(self):
+        if self.win is not None and hasattr(self.win, "apply_prefs"):
+            gone = self.win.apply_prefs()
+            self._fill_mods()
+            if gone:
+                QMessageBox.information(self, "Restart required",
+                                        "These plug-ins were switched off and their windows/buttons removed:\n\n  " + "\n  ".join(gone) +
+                                        "\n\nTheir code stays in memory until you restart " + APP_NAME + " - restart to fully unload them.")
+
+    def _reset(self):
+        SB = QMessageBox.StandardButton
+        if QMessageBox.question(self, "Reset preferences",
+                                "Reset ALL preferences (export location, naming scheme, keybinds, colours, plug-in "
+                                "selection) to their defaults?\n\nThis cannot be undone.", SB.Yes | SB.No, SB.No) != SB.Yes:
+            return
+        s = prefs()
+        for k in self.PREF_KEYS:
+            s.remove(k)
+        s.sync()
+        self.mod_list.clear()
+        self._load()
+        self._run_apply()

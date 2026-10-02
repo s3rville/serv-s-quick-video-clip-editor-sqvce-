@@ -137,9 +137,9 @@ def gen_thumb_file(path, t, key, cache_dir, width=120):
     if os.path.isfile(fn):
         return fn
     try:
-        run_tool([FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-                  "-ss", f"{max(0.0, t):.2f}", "-i", path,
-                  "-frames:v", "1", "-vf", f"scale={width}:-2", fn], timeout=20)
+        run_tool([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-threads", "1",
+                  "-ss", f"{max(0.0, t):.2f}", "-i", path, "-an", "-sn",
+                  "-frames:v", "1", "-vf", f"scale={width}:-2", fn], timeout=20, low=True)
     except Exception:
         return None
     return fn if os.path.isfile(fn) else None
@@ -160,18 +160,75 @@ def image_to_clip(path, dur=IMAGE_CLIP_DUR):
     d = os.path.join(tempfile.gettempdir(), "quickcut_imgclips")
     os.makedirs(d, exist_ok=True)
     out = os.path.join(d, hashlib.md5(key.encode()).hexdigest() + ".mp4")
-    if os.path.isfile(out):
+    if os.path.isfile(out) and os.path.getsize(out) > 0:
         return out
+    tmp = out + ".part.mp4"          # [52.15] write to a temp name: a killed/timed-out encode must never leave a broken cache file
+    small = out + ".src.png"
     try:
-        run_tool([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-loop", "1", "-i", path,
-                  "-t", f"{dur:.3f}", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-                  "-r", "30", "-pix_fmt", "yuv420p", "-an", "-c:v", "libx264",
-                  "-movflags", "+faststart", out], timeout=30)
+        # [52.21] `-loop 1` re-decodes the image for EVERY output frame - with a huge picture that took minutes. Decode it
+        # once into a <=1920 px even-sized PNG, then loop that small file at 1 fps input and let fps=30 duplicate frames.
+        run_tool([FFMPEG, "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", path, "-frames:v", "1", "-vf",
+                  "scale='min(1920,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                  small], timeout=120)
+        src = small if (os.path.isfile(small) and os.path.getsize(small) > 0) else path
+        run_tool([FFMPEG, "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-loop", "1", "-framerate", "1", "-i", src,
+                  "-t", f"{dur:.3f}", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30",
+                  "-pix_fmt", "yuv420p", "-an", "-c:v", "libx264", "-preset", "ultrafast",
+                  "-tune", "stillimage", "-crf", "28", "-g", "300", "-threads", "2",
+                  "-movflags", "+faststart", tmp], timeout=180)
+        if os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
+            os.replace(tmp, out)
     except Exception:
-        return None
+        pass
+    for f in (tmp, small):
+        try:
+            if os.path.isfile(f):
+                os.remove(f)
+        except OSError:
+            pass
     if not (os.path.isfile(out) and os.path.getsize(out) > 0):
         return None
     return out
+
+
+def probe_image(path):
+    """[52.21] image -> baked clip -> Media, in one call so MainWindow.import_paths can run it on a worker thread."""
+    c = image_to_clip(path, dur=IMAGE_MAX_DUR)
+    return probe_media(c) if c else None
+
+
+BLANK_MAX_DUR = 120.0    # [52.17] baked length of a blank clip (its edges can be dragged up to this)
+
+
+def blank_clip(color="#000000", w=1280, h=720, dur=BLANK_MAX_DUR, fps=1):
+    """[52.18] Solid-colour silent video, all-intra. fps=1 (default) = near-instant PREVIEW stand-in (120 frames); the exporter
+    re-bakes it at the project fps and the exact needed length (ExportWorker._bake_blanks). Cached per colour/size/fps/length."""
+    if not FFMPEG:
+        return None
+    w, h = max(2, int(w) // 2 * 2), max(2, int(h) // 2 * 2)
+    c = QColor(color).name().lstrip("#")
+    d = os.path.join(tempfile.gettempdir(), "quickcut_blankclips")
+    os.makedirs(d, exist_ok=True)
+    fps = max(1, int(round(fps)))
+    out = os.path.join(d, f"blank_{c}_{w}x{h}_{int(dur)}_{fps}.mp4")
+    if os.path.isfile(out) and os.path.getsize(out) > 0:
+        return out
+    tmp = out + ".part.mp4"
+    try:
+        run_tool([FFMPEG, "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                  "-i", f"color=c=0x{c}:s={w}x{h}:r={fps}:d={dur:.3f}", "-pix_fmt", "yuv420p", "-an",
+                  "-c:v", "libx264", "-preset", "ultrafast", "-g", "1", "-crf", "30", "-threads", "2",
+                  "-movflags", "+faststart", tmp], timeout=120)
+        if os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
+            os.replace(tmp, out)
+    except Exception:
+        pass
+    try:
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+    except OSError:
+        pass
+    return out if (os.path.isfile(out) and os.path.getsize(out) > 0) else None
 
 
 # [MAP] One daemon thread + queue that loads imported media in the background:
@@ -313,7 +370,7 @@ class MediaWorker(QObject):
                 [FFPROBE, "-v", "error", "-select_streams", "v:0",
                  "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", media.path],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                encoding="utf-8", errors="replace", creationflags=NOWIN)
+                encoding="utf-8", errors="replace", creationflags=NOWIN | LOW_PRIO)
             proc = self._proc
         kfs = []
         deadline = time.monotonic() + self.SCAN_TIMEOUT
@@ -339,3 +396,21 @@ class MediaWorker(QObject):
         self.ready.emit(media)
 
 
+
+
+# [PERF][DISK] The on-disk thumbnail caches (Project thumbs + timeline filmstrips) were never purged [F15]. Called once
+# from a daemon thread at startup: deletes cached jpgs not touched for `days`. Regenerable, so always safe.
+def purge_old_thumb_cache(days=14):
+    cutoff = time.time() - days * 86400
+    for name in ("quickcut_thumbs", "quickcut_clipthumbs"):
+        d = os.path.join(tempfile.gettempdir(), name)
+        try:
+            for fn in os.listdir(d):
+                fp = os.path.join(d, fn)
+                try:
+                    if fn.endswith(".jpg") and os.path.getmtime(fp) < cutoff:
+                        os.remove(fp)
+                except OSError:
+                    pass
+        except OSError:
+            pass

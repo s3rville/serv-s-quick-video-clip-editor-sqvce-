@@ -43,6 +43,7 @@ from PySide6.QtMultimediaWidgets import QVideoWidget, QGraphicsVideoItem
 from utils import *
 from media_model import *
 from probing import *
+from utils import _replace_with_retry          # [52.20] underscore names are NOT exported by `import *`
 
 # ----------------------------------------------------------------------------- export
 # [MAP] Runs on its own QThread. Built by MainWindow._run_export from Sequence.export_parts().
@@ -66,6 +67,11 @@ from probing import *
 # to tell a user cancel from a failure - keep that string.
 # Threading: only this thread's run() spawns export ffmpeg processes; `_proc` is the running one so cancel()
 # can terminate it from the GUI thread.
+# [52.9] EXPORT_HOOKS: objects added by mods. hook.active(worker) -> bool (worker thread, before step C);
+# hook.run(worker, src_path, tmpdir, ext) -> new path or None. Runs after step C, before step D (GIF/Transcode).
+EXPORT_HOOKS = []
+
+
 class ExportWorker(QThread):
     progress = Signal(int, str)
     done = Signal(bool, str)
@@ -460,14 +466,47 @@ class ExportWorker(QThread):
     # Progress numbering: n parts emit 0..n-1, then n ("Joining clips..." / "Writing file..."); GIF/Transcode emit
     # one more. [KNOWN ISSUE F17] With a single part the extra step re-emits 1 (cosmetic: bar does not advance).
     # [PITFALL] tmpdir lives next to the output, so a crash/kill leaves a "quickcut_*" folder behind [F15].
+    # [52.18] Blank clips are only a 1-fps stand-in in the preview; here (worker thread) each is rendered for real at the
+    # project fps/size and exactly the length needed. Returns a NEW parts list (self.parts stays untouched); parts that
+    # shared one blank Media still share one baked Media (`is` merge test in Sequence.export_parts is irrelevant here).
+    def _bake_blanks(self, parts):
+        need = {}
+        for p in parts:
+            if getattr(p[0], "blank", False):
+                need[id(p[0])] = max(need.get(id(p[0]), 0.0), p[2])
+        if not need:
+            return parts
+        baked, out = {}, []
+        for p in parts:
+            m = p[0]
+            if getattr(m, "blank", False):
+                if id(m) not in baked:
+                    path = blank_clip(m.color, m.w, m.h, math.ceil(need[id(m)]) + 1, m.fps)
+                    nm = probe_media(path) if path else None
+                    if not nm:
+                        raise RuntimeError("could not render the blank clip")
+                    nm.name = m.name
+                    baked[id(m)] = nm
+                p = [baked[id(m)]] + list(p[1:])
+            out.append(p)
+        return out
+
     def run(self):
         tmpdir = None
         try:
-            parts = self.parts
+            parts = self._bake_blanks(self.parts)
             tmpdir = tempfile.mkdtemp(prefix="quickcut_", dir=os.path.dirname(os.path.abspath(self.out)))
             # GIF and Transcode both render the normal lossless pipeline to a staging file first,
             # then convert that staged file in a second pass.
-            out = os.path.join(tmpdir, "stage.mkv") if (self.gif or self.transcode) else self.out
+            hooks = []
+            for h in list(EXPORT_HOOKS):
+                try:
+                    if h.active(self):
+                        hooks.append(h)
+                except Exception:
+                    pass
+            staged = bool(self.gif or self.transcode)
+            out = os.path.join(tmpdir, "stage.mkv") if (staged or hooks) else self.out
             files = self._build_part_files(tmpdir, parts)
             self.progress.emit(len(parts), "Writing file..." if len(files) == 1 else "Joining clips...")
             if len(files) == 1:
@@ -482,6 +521,18 @@ class ExportWorker(QThread):
                               "-c", "copy", out])
             else:
                 self._concat_reencode(files, parts, out)
+            if hooks:
+                self.progress.emit(len(parts), "Adding overlays...")
+                ext = ".mkv" if staged else (os.path.splitext(self.out)[1] or ".mp4")
+                for h in hooks:
+                    out = h.run(self, out, tmpdir, ext) or out
+                if not staged:
+                    if os.path.splitext(out)[1].lower() == ext.lower():
+                        ok, err = _replace_with_retry(out, self.out)
+                        if not ok:
+                            raise RuntimeError(err or "could not write the output file")
+                    else:
+                        self._ffmpeg(["-i", out, "-map", "0:v?", "-map", "0:a?", "-c", "copy", self.out])
             if self.gif:
                 self.progress.emit(1 if len(parts) == 1 else len(parts) + 1, "Creating GIF...")
                 self._make_gif(out)

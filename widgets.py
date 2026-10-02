@@ -27,7 +27,7 @@ import subprocess
 from PySide6.QtCore import (Qt, QUrl, QTimer, QObject, Signal, QRectF, QPointF, QLineF,
                             QSize, QMimeData, QThread, QPoint, QEvent, QRect, QSizeF, QSettings,
                             QVariantAnimation, QEasingCurve)
-from PySide6.QtGui import (QAction, QColor, QPainter, QPen, QPixmap, QIcon, QPalette, QFont,
+from PySide6.QtGui import (QLinearGradient, QAction, QColor, QPainter, QPen, QPixmap, QIcon, QPalette, QFont,
                            QPolygonF, QKeySequence, QShortcut, QPainterPath, QRegion, QIntValidator,
                            QCursor, QDesktopServices, QTransform, QDrag)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -92,7 +92,8 @@ class Panel(QFrame):
 class VUMeter(QWidget):
     """Two-bar (L/R) audio level meter with peak-hold, for the left edge of the timeline."""
 
-    DECAY_PER_TICK = 0.80      # displayed level multiplies by this every tick unless a louder level arrives
+    FLOOR_DB = -54.0           # [51.3] dB scale: -54 dB = empty bar, 0 dB = full (linear RMS barely moved the bar)
+    DECAY_PER_TICK = 0.90      # displayed level multiplies by this every tick unless a louder level arrives
     PEAK_DECAY_PER_TICK = 0.985
     TICK_MS = 33
 
@@ -114,9 +115,15 @@ class VUMeter(QWidget):
     # [MAP] Called from Engine.audioLevel. While playing: instant attack, decay/peak fall happen only in
     # _tick (so a burst is visible even between two ticks). While paused: the exact level reported is shown
     # immediately with no smoothing at all, so scrubbing to a quieter/louder spot updates right away.
+    def _frac(self, lin):
+        """Linear RMS amplitude -> 0..1 bar fraction on a dB scale (much more sensitive to quiet audio)."""
+        if lin <= 1e-6:
+            return 0.0
+        return max(0.0, min(1.0, 1.0 - math.log10(min(lin, 1.0)) * 20.0 / self.FLOOR_DB))
+
     def set_level(self, l, r):
-        l = min(1.3, max(0.0, l))
-        r = min(1.3, max(0.0, r))
+        l = self._frac(l)
+        r = self._frac(r)
         if self._playing:
             self._l = max(self._l, l)
             self._r = max(self._r, r)
@@ -136,14 +143,6 @@ class VUMeter(QWidget):
         self._peak_r = max(self._r, self._peak_r * self.PEAK_DECAY_PER_TICK)
         self.update()
 
-    @staticmethod
-    def _bar_color(frac):
-        if frac > 0.9:
-            return QColor("#ff4d4d")
-        if frac > 0.7:
-            return QColor("#ffd23f")
-        return QColor("#3ddc84")
-
     def paintEvent(self, ev):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -161,7 +160,13 @@ class VUMeter(QWidget):
             fh = bar_rect.height() * frac
             filled = QRectF(bar_rect.x(), bar_rect.bottom() - fh, bar_rect.width(), fh)
             if fh > 0:
-                p.setBrush(self._bar_color(frac))
+                # [51.3] colour = absolute loudness: green (bottom) > yellow > red (top), gradient fixed to the full bar
+                g = QLinearGradient(0, bar_rect.bottom(), 0, bar_rect.top())
+                g.setColorAt(0.0, QColor("#22c55e"))
+                g.setColorAt(0.6, QColor("#3ddc84"))
+                g.setColorAt(0.8, QColor("#ffd23f"))
+                g.setColorAt(1.0, QColor("#ff3b3b"))
+                p.setBrush(g)
                 p.drawRoundedRect(filled, 2, 2)
             pf = max(0.0, min(1.0, pk))
             py = bar_rect.bottom() - bar_rect.height() * pf

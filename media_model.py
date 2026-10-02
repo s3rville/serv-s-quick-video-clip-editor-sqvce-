@@ -68,6 +68,8 @@ class Media:
         self.vcodec, self.acodec = vcodec, acodec
         self.has_video = has_video
         self.is_image = is_image   # imported from a still picture (baked into a short silent video - see image_to_clip)
+        self.blank = False         # [52.17] generated solid-colour clip (see probing.blank_clip); never in the Project panel
+        self.color = "#000000"     # [52.17] its colour (only meaningful when blank)
         self.mark_in = 0.0
         self.mark_out = dur
         self.keyframes = None      # filled in by background worker
@@ -110,6 +112,12 @@ class Media:
 #   10  Sequence.export_parts merge test          compares xf and opts, so a new opts field automatically
 #                                                 stops clips that differ in it from being merged
 # Seg objects use __slots__: assigning an attribute that is not in __slots__ raises AttributeError.
+class Snap(list):
+    """[52.11] A snapshot list that also carries `ext` = {name: state} from Sequence.ext providers (mods).
+    Plain-list behaviour/equality is unchanged (ext is ignored by ==), so every existing snapshot user keeps working."""
+    ext = None
+
+
 class Seg:
     """A clip on the timeline: a slice [in_s, out_s] of a Media (source seconds).
     `dur` is the TIMELINE duration (source span / speed); `src_dur` is the source span."""
@@ -187,6 +195,7 @@ class Sequence(QObject):
     """Magnetic (gap-free) sequence with undo/redo."""
     edited = Signal()   # committed change -> preview must refresh
     live = Signal()     # in-progress drag -> repaint only
+    blocked = Signal(str)   # [52.25] an edit() was refused because its layer is locked (arg = layer key)
 
     def __init__(self):
         super().__init__()
@@ -196,6 +205,27 @@ class Sequence(QObject):
         self.precise = False   # when True, cuts may land off-keyframe; export re-encodes just that sliver
         self.groups = {}       # grp_id -> {"color": "#rrggbb", "name": ""} - visual only, not undo-tracked
         self._next_grp = 1
+        # [PERF] starts()/total() are O(n) over every clip and locate() was an O(n) linear scan; all three are
+        # called on every scrub sample and every seek, so on a big project they add up fast. `_starts_cache` is
+        # the memoized starts() list (or None when stale); `_total_cache` its total() companion. Cache
+        # correctness relies on the same invariant the rest of the class already documents: every mutation of
+        # `segs` or of a duration-affecting Seg field (in_s/out_s/speed) - whether via edit(fn) or a Timeline
+        # drag mutating in place - is always followed, in the SAME call, by an `edited` or `live` emit (edit()
+        # itself guarantees this; Timeline._trim/_move do it by hand). So invalidating on both signals covers
+        # every path with nothing missed - see _invalidate_geometry.
+        # [52.11] History providers (mods): name -> object with ext_snapshot() -> comparable plain data and
+        # ext_restore(data). Their state rides inside every snapshot, so Ctrl+Z / Ctrl+Shift+Z cover it.
+        # A mod records its own change with seq.commit(before_snapshot); seq.edited.emit().
+        self.ext = {}
+        self.locked = set()    # [52.25] layer keys locked in Advanced mode ("video", "audio", lane keys). Not undo-tracked, never saved.
+        self._starts_cache = None
+        self._total_cache = None
+        self.edited.connect(self._invalidate_geometry)
+        self.live.connect(self._invalidate_geometry)
+
+    def _invalidate_geometry(self):
+        self._starts_cache = None
+        self._total_cache = None
 
     # [MAP] Visual-only clip grouping (feature: multi-select + right-click "Group"). Never affects export.
     def new_group(self):
@@ -210,13 +240,29 @@ class Sequence(QObject):
     # [COUPLING] Tuple order == Seg.__init__ order (see the Seg checklist). Snapshots hold Media by reference and
     # plain values for everything else, so they are cheap and immune to later in-place mutation of a Seg.
     def snapshot(self):
-        return [(s.media, s.in_s, s.out_s, s.xf, s.mute, s.speed, s.mirror, s.rot, s.rev, s.grp,
-                  s.atracks, s.vol_db, s.track_type) for s in self.segs]
+        snap = Snap((s.media, s.in_s, s.out_s, s.xf, s.mute, s.speed, s.mirror, s.rot, s.rev, s.grp,
+                     s.atracks, s.vol_db, s.track_type) for s in self.segs)
+        snap.ext = {}
+        for k, p in self.ext.items():
+            try:
+                snap.ext[k] = p.ext_snapshot()
+            except Exception:
+                pass
+        return snap
 
     # [PITFALL] Builds NEW Seg objects. Never keep a Seg reference across undo/redo (it would point at an orphan).
     # Timeline.sel is an index, which is why selection survives (clamped in Timeline._on_seq).
     def _restore(self, snap):
         self.segs = [Seg(*x) for x in snap]
+        self._invalidate_geometry()
+        ext = getattr(snap, "ext", None)
+        if ext:
+            for k, p in self.ext.items():
+                if k in ext:
+                    try:
+                        p.ext_restore(ext[k])
+                    except Exception:
+                        pass
 
     # [MAP] Push `before` on the undo stack (depth capped at 100) and clear redo. Timeline drags call this directly.
     def commit(self, before):
@@ -228,7 +274,12 @@ class Sequence(QObject):
     # (True, 0, 0.0, None, a float) COMMITS. The identity test `r is not False` is deliberate: split_at returns the
     # split time (a float) and edit() hands it back to MainWindow.split_at for the status bar. Do not "simplify" to
     # `if r:` - a legitimate 0.0 would then be treated as failure.
-    def edit(self, fn):
+    # [52.25] `layer` = which row the edit touches. A locked layer refuses it (returns False = "nothing happened", the same
+    # value callers already handle) and emits `blocked`. Pass layer=None for edits that only touch lane items (text/audio).
+    def edit(self, fn, layer="video"):
+        if layer is not None and layer in self.locked:
+            self.blocked.emit(str(layer))
+            return False
         before = self.snapshot()
         r = fn()
         if r is not False:
@@ -251,26 +302,39 @@ class Sequence(QObject):
             self.edited.emit()
 
     def total(self):
-        return sum(s.dur for s in self.segs)
+        if self._total_cache is None:
+            self.starts()
+        return self._total_cache
 
+    # [PERF] Memoized - do NOT mutate the returned list (callers use `starts() + [...]`, which copies).
     def starts(self):
-        out, acc = [], 0.0
-        for s in self.segs:
-            out.append(acc)
-            acc += s.dur
-        return out
+        c = self._starts_cache
+        if c is None:
+            c, acc = [], 0.0
+            for s in self.segs:
+                c.append(acc)
+                acc += s.dur
+            self._starts_cache, self._total_cache = c, acc
+        return c
 
     # [MAP] timeline time -> (segment index, offset inside that segment in TIMELINE seconds). Past the end it
     # returns (last index, its dur). Empty timeline returns (None, 0.0) - callers MUST handle idx None.
+    # [PERF] O(log n) bisect over the cached starts() instead of a linear scan; same results as the old scan
+    # (t<0 -> (0, 0.0); t>=total -> (last, last.dur)).
     def locate(self, t):
-        acc = 0.0
-        for i, s in enumerate(self.segs):
-            if t < acc + s.dur:
-                return i, max(0.0, t - acc)
-            acc += s.dur
-        if self.segs:
-            return len(self.segs) - 1, self.segs[-1].dur
-        return None, 0.0
+        st = self.starts()
+        n = len(st)
+        if n == 0:
+            return None, 0.0
+        i = max(0, bisect.bisect_right(st, t) - 1)
+        d = self.segs[i].dur
+        if not t < st[i] + d:                   # same comparison the old linear scan used (float-exact)
+            if i < n - 1:                       # float-edge safety net: behave like the old scan and move on
+                i += 1
+                d = self.segs[i].dur
+            if i == n - 1 and not t < st[i] + d:
+                return i, d
+        return i, max(0.0, t - st[i])
 
     # [PITFALL] The FIRST clip's fps drives timecode display, frame stepping (MainWindow.step) and the ruler for
     # the whole timeline, even when later clips have different frame rates.
@@ -303,12 +367,14 @@ class Sequence(QObject):
                                        s.atracks, s.vol_db, s.track_type),
                                    Seg(s.media, src, s.out_s, s.xf, s.mute, s.speed, s.mirror, s.rot, s.rev, s.grp,
                                        s.atracks, s.vol_db, s.track_type)]
+        self._invalidate_geometry()
         return src
 
     # [MAP] Ripple delete: neighbours close the gap automatically (there is no gap model).
     def delete(self, idx):
         if 0 <= idx < len(self.segs):
             del self.segs[idx]
+            self._invalidate_geometry()
             return True
         return False
 
@@ -320,6 +386,7 @@ class Sequence(QObject):
             return False
         for i in idxs:
             del self.segs[i]
+        self._invalidate_geometry()
         return True
 
     # [MAP][FIX B1] Index just past the last clip sharing segs[idx]'s group id. Groups are always stored as a
@@ -339,9 +406,11 @@ class Sequence(QObject):
     def insert_at(self, t, seg, tol=0.1):
         if not self.segs:
             self.segs.append(seg)
+            self._invalidate_geometry()
             return 0
         if t >= self.total() - tol:
             self.segs.append(seg)
+            self._invalidate_geometry()
             return len(self.segs) - 1
         idx, off = self.locate(max(0.0, t))
         s = self.segs[idx]
@@ -353,6 +422,7 @@ class Sequence(QObject):
             else:
                 pos = idx
             self.segs.insert(pos, seg)
+            self._invalidate_geometry()
             return pos
         if s.dur - off <= tol:
             if idx + 1 < len(self.segs) and s.grp is not None and self.segs[idx + 1].grp == s.grp:
@@ -360,12 +430,14 @@ class Sequence(QObject):
             else:
                 pos = idx + 1
             self.segs.insert(pos, seg)
+            self._invalidate_geometry()
             return pos
         # [FIX] Dropping/inserting inside a clip must never CUT that clip - it just pushes the whole
         # thing to whichever of its edges is nearer, same as the "no keyframe inside" fallback used to
         # do. (Previously this branch split the clip in two around the insert point.)
         pos = self._group_end(idx) if s.grp is not None else (idx if off < s.dur / 2 else idx + 1)
         self.segs.insert(pos, seg)
+        self._invalidate_geometry()
         return pos
 
     # [INVARIANT] The bridge to ExportWorker. Returns mutable LISTS [media, in_s, out_s, xf, opts] and merges a clip

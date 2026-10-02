@@ -54,7 +54,7 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
 IMAGE_CLIP_DUR = 4.0    # default timeline length of an imported still image (it is baked into a real video on import)
 IMAGE_MAX_DUR = 600.0   # baked length of that video (bug fix: lets the user freely drag a still's clip edges
                         # to lengthen it on the timeline, up to 10 minutes, instead of hard-capping at IMAGE_CLIP_DUR)
-VIDEO_FILTER = ("Media files (*.mp4 *.mkv *.mov *.avi *.webm *.ts *.m4v *.flv *.mts *.m2ts *.mp3 *.m4a *.wav "
+VIDEO_FILTER = ("Media files (*.mp4 *.mkv *.mov *.avi *.webm *.ts *.m4v *.flv *.mts *.m2ts *.mp3 *.m4a *.wav *.aac *.flac *.ogg *.opus "
                  "*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff);;All files (*.*)")
 
 
@@ -91,9 +91,18 @@ FFPROBE = find_tool("ffprobe")
 # [MAP] Small blocking subprocess helper (text mode, utf-8, undecodable bytes replaced, no console window).
 # [PITFALL] It blocks its caller. It is used by probe_media (on the GUI thread!) and gen_thumb_file (on
 # worker threads). Do not use it for anything long-running - use ExportWorker or a thread instead.
-def run_tool(cmd, timeout=None):
+# [PERF] low=True runs the child at below-normal priority (Windows priority class / POSIX nice 10) so background
+# helpers (thumbnails) can't starve the UI or playback. LOW_PRIO is also usable as an extra creationflags bit.
+LOW_PRIO = 0x00004000 if os.name == "nt" else 0     # BELOW_NORMAL_PRIORITY_CLASS
+
+
+def run_tool(cmd, timeout=None, low=False):
+    kw = {}
+    if low and os.name != "nt":
+        kw["preexec_fn"] = lambda: os.nice(10)
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", creationflags=NOWIN, timeout=timeout)
+                          errors="replace", creationflags=NOWIN | (LOW_PRIO if low else 0),
+                          timeout=timeout, **kw)
 
 
 # [MAP] (used_MB, total_MB) of physical RAM or None. Order: psutil (optional) -> Windows GlobalMemoryStatusEx
@@ -277,3 +286,103 @@ def xf_filter(xf):
     return f + "setsar=1"
 
 
+
+
+# Project name - shown in the title bar / window title / Preferences. Changed ONLY by the owner or on request.
+APP_NAME = "SQVCE n4.0"
+
+
+# ====================================================================================================
+# [FEATURE 52.0] Preferences storage: keybind table, theme colours, export naming scheme, mods scanning.
+# Everything is stored in the ONE QSettings("QuickCut","QuickCut") under pref_* keys (JSON for dict/list values).
+# ====================================================================================================
+def prefs():
+    return QSettings("QuickCut", "QuickCut")
+
+
+def pref_json(key, default):
+    try:
+        v = json.loads(prefs().value(key, "", str) or "null")
+        return v if isinstance(v, type(default)) else default
+    except Exception:
+        return default
+
+
+# (id, label, default key). EVERY keyboard binding of the program lives here; MainWindow.build_actions maps id -> handler.
+KEYBIND_DEFS = (
+    ("import", "Import media", "Ctrl+I"), ("save_over", "Save-Over", "Ctrl+S"), ("export", "Export", "Ctrl+M"),
+    ("undo", "Undo", "Ctrl+Z"), ("redo", "Redo", "Ctrl+Shift+Z"), ("split", "Add edit (split) at playhead", "Shift+C"),
+    ("select_all", "Select all timeline clips", "Ctrl+A"), ("copy", "Copy clip", "Ctrl+C"), ("paste", "Paste clip", "Ctrl+V"), ("duplicate", "Duplicate clip (video / text / audio)", "Ctrl+D"), ("delete", "Delete / ripple delete", "Delete"),
+    ("rename", "Rename project file", "F2"), ("quit", "Quit", "Ctrl+Q"),
+    ("play_pause", "Play / pause (hold while playing = 2x)", "Space"),
+    ("tool_select", "Selection tool", "V"), ("tool_razor", "Razor / cut tool", "C"), ("tool_crop", "Crop tool", "X"),
+    ("tool_resize", "Resize tool (again = rotate 90)", "R"),
+    ("tool_plugin", "Plugin tool (press again to cycle plugin tools)", "Z"),
+    ("tool_ok", "Crop / Resize: OK", "Return"), ("tool_cancel", "Crop / Resize: Cancel", "Escape"),
+    ("move_left", "Move clip left", "Alt+Left"), ("move_right", "Move clip right", "Alt+Right"),
+    ("step_back", "Step back 1 frame", "Left"), ("step_fwd", "Step forward 1 frame", "Right"),
+    ("step_back5", "Step back 5 frames", "Shift+Left"), ("step_fwd5", "Step forward 5 frames", "Shift+Right"),
+    ("prev_edit", "Previous edit", "Up"), ("next_edit", "Next edit", "Down"),
+    ("go_start", "Go to start", "Home"), ("go_end", "Go to end", "End"),
+)
+
+
+def keybind_map():
+    m = {k: d for k, _, d in KEYBIND_DEFS}
+    for k, v in pref_json("pref_keybinds", {}).items():
+        if k in m and isinstance(v, str):
+            m[k] = v                      # "" = deliberately unbound
+    return m
+
+
+THEME_DEFAULTS = {"bg": "#1a1a1a", "surface": "#2b2b2b", "panel": "#232323", "header": "#2a2a2a",
+                  "base": "#1e1e1e", "button": "#383838", "text": "#c8c8c8", "accent": "#2d8ceb"}
+THEME_LABELS = {"bg": "Window / top bar background", "surface": "Dialog background", "panel": "Panel background",
+                "header": "Panel header / menus", "base": "Lists & input background", "button": "Buttons",
+                "text": "Text", "accent": "Accent colour"}
+
+
+def theme_map():
+    t = dict(THEME_DEFAULTS)
+    for k, v in pref_json("pref_theme", {}).items():
+        if k in t and isinstance(v, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", v):
+            t[k] = v.lower()
+    return t
+
+
+DEFAULT_SCHEME = "%pn_%ra{4}"
+# (token, description) - shown in Preferences > General. Follows "naming guide for ai.txt".
+NAME_TOKENS = (("%pn", "project name (source file name)"), ("%mo", "month 01-12"), ("%d", "day 01-31"),
+               ("%yy", "year, 2 digits"), ("%yyyy", "year, 4 digits"), ("%h", "hour 00-23"), ("%mi", "minute 00-59"),
+               ("%s", "second 00-59"), ("%ra{10}", "N random letters+digits"), ("%rn{4}", "N random digits"))
+
+
+def name_scheme():
+    """Saved naming scheme; the old built-in defaults ("%pn_edit" from 52.1, "{name}_edit" from 52.0) count as 'never customised'."""
+    v = prefs().value("pref_name_scheme", DEFAULT_SCHEME, str).strip()
+    return DEFAULT_SCHEME if v in ("", "%pn_edit", "{name}_edit") else v
+
+
+def format_out_name(scheme, src_path, ext, folder, mode="Video", taken=None):
+    """Full output path for the Save dialog: folder + scheme (tokens filled, bad filename chars -> _) + ext.
+    Tokens: %pn %mo %d %yy %yyyy %h %mi %s %ra{N} %rn{N}; unknown text/% stays literal."""
+    import datetime, random, string
+    now = datetime.datetime.now()
+    vals = {"pn": os.path.splitext(os.path.basename(src_path))[0], "mo": f"{now.month:02d}", "d": f"{now.day:02d}",
+            "yyyy": f"{now.year:04d}", "yy": f"{now.year % 100:02d}", "h": f"{now.hour:02d}", "mi": f"{now.minute:02d}",
+            "s": f"{now.second:02d}"}
+    rnd = random.SystemRandom()
+
+    def sub(m):
+        t = m.group(1)
+        if t in ("ra", "rn"):
+            n = max(1, min(int(m.group(2) or 1), 64))
+            return "".join(rnd.choice(string.ascii_letters + string.digits if t == "ra" else string.digits) for _ in range(n))
+        return vals[t]
+    s = re.sub(r"%(yyyy|yy|mo|mi|pn|ra|rn|d|h|s)(?:\{(\d+)\})?", lambda m: sub(m) if (m.group(1) in ("ra", "rn") or not m.group(2)) else m.group(0),
+               (scheme or "").strip().replace("{name}", "%pn") or DEFAULT_SCHEME)   # {name} = 52.0 legacy
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", s).strip() or "edit"
+    return os.path.join(folder, s + ext)
+
+
+MODS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mods")

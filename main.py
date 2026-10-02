@@ -49,14 +49,20 @@ from widgets import *
 from preview_stack import *
 from timeline import *
 from playback import *
+from plugins import *
+from recovery import *
+from crashlog import *
 from main_window import *
 
 def main():
+    install_crash_logging()          # [52.8] first thing: catch start-up errors and native crashes too
+    threading.Thread(target=purge_old_thumb_cache, daemon=True).start()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setPalette(dark_palette())
-    app.setStyleSheet(QSS)
+    app.setStyleSheet(build_qss())
     win = MainWindow([a for a in sys.argv[1:] if os.path.isfile(a)])
+    crash_set_window(win)
     win.show()
     sys.exit(app.exec())
 

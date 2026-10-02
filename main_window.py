@@ -26,7 +26,7 @@ import subprocess
 # QVideoWidget (QtMultimediaWidgets - replaced by VideoView/QGraphicsVideoItem). Left as-is on purpose.
 from PySide6.QtCore import (Qt, QUrl, QTimer, QObject, Signal, QRectF, QPointF, QLineF,
                             QSize, QMimeData, QThread, QPoint, QEvent, QRect, QSizeF, QSettings,
-                            QVariantAnimation, QEasingCurve)
+                            QVariantAnimation, QEasingCurve, QEventLoop)
 from PySide6.QtGui import (QAction, QColor, QPainter, QPen, QPixmap, QIcon, QPalette, QFont,
                            QPolygonF, QKeySequence, QShortcut, QPainterPath, QRegion, QIntValidator,
                            QCursor, QDesktopServices, QTransform, QDrag)
@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QMenu, QCheckBox, QFrame, QProgressDialog, QButtonGroup,
                                QAbstractItemView, QInputDialog, QLineEdit, QDialog, QDoubleSpinBox,
                                QGraphicsView, QGraphicsScene, QComboBox, QSpinBox, QGridLayout, QSizePolicy,
-                               QColorDialog)
+                               QColorDialog, QDockWidget)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget, QGraphicsVideoItem
 
@@ -49,6 +49,9 @@ from widgets import *
 from preview_stack import *
 from timeline import *
 from playback import *
+from plugins import *
+from audio_track import *
+from recovery import *
 
 # ----------------------------------------------------------------------------- styling
 # [MAP] Application-wide Qt style sheet (dark theme) applied in main() on top of the Fusion style + dark_palette().
@@ -73,6 +76,9 @@ QFrame#topbar { background: #1a1a1a; border-bottom: 1px solid #101010; }
 QFrame#controlbar { background: #262626; border-top: 1px solid #101010; }
 QFrame#nav { background: #232323; border-top: 1px solid #101010; }
 QFrame#optSection { background: #262626; border: 1px solid #3a3a3a; border-radius: 4px; }
+QMainWindow::separator { background: #101010; width: 3px; height: 3px; }
+QDockWidget { color: #eaeaea; }
+QDockWidget::title { background: #2a2a2a; padding: 5px 8px; border-bottom: 1px solid #101010; }
 QSplitter::handle { background: #101010; }
 QSplitter::handle:horizontal { width: 3px; }
 QSplitter::handle:vertical { height: 3px; }
@@ -117,14 +123,82 @@ QLabel#warnPill { color: #f4c430; background: #3a3016; border: 1px solid #6b5a1e
 
 
 def dark_palette():
+    t = theme_map()
     pal = QPalette()
     R = QPalette.ColorRole
-    for role, col in ((R.Window, "#2b2b2b"), (R.WindowText, "#dcdcdc"), (R.Base, "#1e1e1e"),
-                      (R.AlternateBase, "#262626"), (R.Text, "#dcdcdc"), (R.Button, "#383838"),
-                      (R.ButtonText, "#dcdcdc"), (R.Highlight, "#2d8ceb"), (R.HighlightedText, "#ffffff"),
-                      (R.ToolTipBase, "#2a2a2a"), (R.ToolTipText, "#dddddd")):
+    for role, col in ((R.Window, t["surface"]), (R.WindowText, t["text"]), (R.Base, t["base"]),
+                      (R.AlternateBase, t["panel"]), (R.Text, t["text"]), (R.Button, t["button"]),
+                      (R.ButtonText, t["text"]), (R.Highlight, t["accent"]), (R.HighlightedText, "#ffffff"),
+                      (R.ToolTipBase, t["header"]), (R.ToolTipText, t["text"])):
         pal.setColor(role, QColor(col))
     return pal
+
+
+# [FEATURE 52.0] QSS with the user's theme colours substituted in ONE regex pass (so swapped colours can't chain).
+def build_qss():
+    t = theme_map()
+    m = {THEME_DEFAULTS[k]: t[k] for k in THEME_DEFAULTS if t[k] != THEME_DEFAULTS[k]}
+    if t["accent"] != THEME_DEFAULTS["accent"]:
+        a = QColor(t["accent"])
+        m["#4aa0f5"], m["#2d5a8a"] = a.lighter(120).name(), a.darker(150).name()
+    return re.sub(r"#[0-9a-fA-F]{6}", lambda mo: m.get(mo.group(0).lower(), mo.group(0)), QSS)
+
+
+# [FEATURE 51.12] Keeps the Timeline dock's height when the WINDOW is resized (extra/lost height goes to the top row, i.e. the
+# Preview/Project docks). A dock Resize that arrives together with a new window size is a window resize -> restore the last
+# height the layout had at a constant window size (= what the user set by dragging the separator). Enabled shortly after start-up
+# so the initial layout passes are not recorded.
+class TimelineHeightKeeper(QObject):
+    def __init__(self, win, dock):
+        super().__init__(win)
+        self.win, self.dock = win, dock
+        self.h, self.sz, self.pending, self.on = None, win.size(), False, False
+        dock.installEventFilter(self)
+        QTimer.singleShot(1500, self.enable)
+
+    def enable(self):
+        self.on, self.sz, self.h = True, self.win.size(), self.dock.height()
+
+    def eventFilter(self, o, e):
+        if self.on and o is self.dock and e.type() == QEvent.Type.Resize:
+            sz = self.win.size()
+            if sz != self.sz:                       # the window changed size: keep the timeline's height
+                self.sz = sz
+                if not self.pending and abs(self.dock.height() - self.h) > 1:
+                    self.pending = True
+                    QTimer.singleShot(0, self.restore)
+            elif not self.pending and not self.dock.isHidden():
+                self.h = self.dock.height()         # separator drag / layout change at constant window size
+        return False
+
+    def restore(self):
+        self.pending = False
+        d, w = self.dock, self.win
+        if self.h is None or d.isHidden() or d.isFloating():
+            return
+        ref = next((x for x in (w.docks["preview"], w.docks["project"]) if not x.isHidden() and not x.isFloating()), None)
+        delta = d.height() - self.h
+        if ref is None or abs(delta) <= 1:
+            return
+        w.dock_host.resizeDocks([ref, d], [max(1, ref.height() + delta), self.h], Qt.Orientation.Vertical)
+
+
+def eye_icon(color="#d0d0d0"):
+    pm = QPixmap(40, 40)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.moveTo(3, 20)
+    path.quadTo(20, 3, 37, 20)
+    path.quadTo(20, 37, 3, 20)
+    p.setPen(QPen(QColor(color), 3))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawPath(path)
+    p.setBrush(QColor(color))
+    p.drawEllipse(QPointF(20, 20), 6, 6)
+    p.end()
+    return QIcon(pm)
 
 
 # ----------------------------------------------------------------------------- main window
@@ -155,7 +229,7 @@ class MainWindow(QMainWindow):
     # imported on the next event-loop turn; a missing ffmpeg shows a warning box but the app continues.
     def __init__(self, files=None):
         super().__init__()
-        self.APP_TITLE = "QuickCut"
+        self.APP_TITLE = APP_NAME
         self.setWindowTitle(self.APP_TITLE)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self._is_maximized = False
@@ -188,27 +262,27 @@ class MainWindow(QMainWindow):
 
         root = QWidget()
         root.setObjectName("root")
-        outer_lay.addWidget(root, 1)
+        from PySide6.QtWidgets import QStackedWidget
+        self.page_stack = QStackedWidget()          # [52.0] page 0 = the editor; mod tabs are added after it
+        self.page_stack.addWidget(root)
+        outer_lay.addWidget(self.page_stack, 1)
         v = QVBoxLayout(root)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
         v.addWidget(self.build_topbar())
 
-        main_split = QSplitter(Qt.Orientation.Vertical)
-        v.addWidget(main_split, 1)
-
-        top_split = QSplitter(Qt.Orientation.Horizontal)
-        top_split.addWidget(self.build_project())
-        top_split.addWidget(self.build_video_column())
-        top_split.setSizes([300, 1020])
-
-        main_split.addWidget(top_split)
-        main_split.addWidget(self.build_timeline_panel())
-        main_split.setSizes([560, 220])
+        v.addWidget(self.build_docks(), 1)
 
         self.engine = Engine(self.seq, self.video)
+        self.atrack = AudioTrack(self)                  # [52.19] audio strip above the video row (needs tl + engine)
         self.proxy = ReverseProxy()
         self.engine.proxies = self.proxy.files
+        # [PERF] Adaptive-resolution scrubbing (see ScrubProxy). Forwarded cancel_media/shutdown via companions.
+        self.scrub_proxy = ScrubProxy()
+        self.scrub_proxy.in_use = lambda: self.engine.path
+        self.proxy.companions.append(self.scrub_proxy)
+        self.engine.scrub_files = self.scrub_proxy.files
+        self.engine.scrub_proxy = self.scrub_proxy
         self.proxy.ready.connect(self.on_proxy_ready)
         self.engine.playheadChanged.connect(self.on_playhead)
         self.engine.playStateChanged.connect(
@@ -228,7 +302,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(2000, quiet_ffmpeg_log)      # again once Qt's backend has surely loaded
 
         self.build_actions()
-        self.build_shortcuts()
+        self.plugins = PluginHost(self)
+        self.plugins.sync()
         self.update_labels()
         QApplication.instance().installEventFilter(self)
         self.statusBar().showMessage(
@@ -238,8 +313,242 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "ffmpeg not found",
                                 "Could not find ffmpeg.exe.\n\nPlace ffmpeg.exe and ffprobe.exe next to this "
                                 "program (or add them to PATH), then restart.")
-        if files:
-            QTimer.singleShot(0, lambda: self.import_paths(files))
+        # [52.7] Crash recovery: on the first event-loop turn (window already shown) it offers the previous session
+        # if the last run ended abnormally, and only THEN imports the command-line files.
+        self.recovery = Recovery(self)
+        QTimer.singleShot(0, lambda: self.recovery.startup(files))
+
+    # ------------------------------------------------------------------ [FEATURE v50.2] modular dock layout
+    # Project / Preview / Timeline are QDockWidgets inside an inner QMainWindow (self.dock_host, hidden central
+    # widget). LOCKED (default): no title bars, panels can't move (separators still resize). UNLOCKED (right-click a
+    # panel header / dock title / separator -> "Unlock layout"): dock titles appear, drag them to re-dock or tab; the
+    # layout re-locks after one move (or via "Lock layout"). Layout = QSettings "dock_layout" (saved on lock + close).
+    def build_docks(self):
+        h = self.dock_host = QMainWindow()
+        h.setWindowFlags(Qt.WindowType.Widget)
+        h.setDockNestingEnabled(True)
+        h.setDockOptions(QMainWindow.DockOption.AllowNestedDocks | QMainWindow.DockOption.AllowTabbedDocks)  # no AnimatedDocks: animation re-lays-out Timeline/Video every frame (lag)
+        ph = QWidget()
+        h.setCentralWidget(ph)
+        ph.hide()
+        self._layout_unlocked = False
+        self._layout_busy = True
+        self.docks = {}
+        self.mod_docks = {}                          # [52.2] "tab" mods: key "mod:file.py" -> QDockWidget (not in the saved layout)
+        _hd = QSettings("QuickCut", "QuickCut").value("hidden_docks", [])
+        try:
+            self._dock_sizes = {k: tuple(v) for k, v in json.loads(QSettings("QuickCut", "QuickCut").value("dock_sizes", "{}", str)).items()}
+        except Exception:
+            self._dock_sizes = {}                    # key -> (width, height) each panel had when it was last hidden
+        self._hidden_docks = set(_hd if isinstance(_hd, (list, tuple)) else ([_hd] if _hd else []))     # panels hidden via the eye button
+        for key, title, w in (("project", "Project", self.build_project()),
+                              ("preview", "Preview", self.build_video_column()),
+                              ("timeline", "Timeline", self.build_timeline_panel())):
+            d = QDockWidget(title)
+            d.setObjectName("dock_" + key)
+            d.setWidget(w)
+            d.dockLocationChanged.connect(self._on_dock_moved)
+            d.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            d.customContextMenuRequested.connect(lambda p, d=d: self.layout_menu(d, p))
+            d._empty_title = QWidget()      # reused (never re-created) so no widget is destroyed mid-drag
+            d._empty_title.setFixedHeight(0)
+            self.docks[key] = d
+        for w in [h] + [f for pn in (self.proj_panel, self.tl_panel) for f in pn.findChildren(QFrame, "panelHead")] \
+                + self.video.window().findChildren(QFrame, "controlbar"):
+            w.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            w.customContextMenuRequested.connect(lambda p, w=w: self.layout_menu(w, p))
+        self._default_dock_layout()
+        st = QSettings("QuickCut", "QuickCut").value("dock_layout")
+        if st:
+            try:
+                if not h.restoreState(st):
+                    self._default_dock_layout()
+            except Exception:
+                self._default_dock_layout()
+        self._apply_dock_lock()
+        for k in self._hidden_docks:
+            if k in self.docks:
+                self.docks[k].setVisible(False)
+        self._layout_busy = False
+        QTimer.singleShot(300, self._validate_layout)
+        self._tl_keeper = TimelineHeightKeeper(self, self.docks["timeline"])
+        return h
+
+    # Safety net: a dock that is hidden / floating / squashed to nothing (bad drop, bad saved state) -> default layout.
+    def _validate_layout(self):
+        bad = any(d.isHidden() or d.isFloating() or d.width() < 60 or d.height() < 40
+                  for k, d in self.docks.items() if k not in self._hidden_docks)   # user-hidden panels are fine
+        if bad:
+            self.reset_layout(silent=True)
+        return not bad
+
+    def _default_dock_layout(self):
+        h, d = self.dock_host, self.docks
+        for x in d.values():
+            x.setFloating(False)
+            h.removeDockWidget(x)
+        h.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, d["project"])
+        h.splitDockWidget(d["project"], d["preview"], Qt.Orientation.Horizontal)
+        h.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, d["timeline"])
+        for x in d.values():
+            x.setVisible(True)
+        def sizes():
+            h.resizeDocks([d["project"], d["preview"]], [300, 1020], Qt.Orientation.Horizontal)
+            h.resizeDocks([d["project"], d["timeline"]], [560, 220], Qt.Orientation.Vertical)
+        sizes()
+        QTimer.singleShot(0, sizes)
+        for k, x in self.mod_docks.items():
+            self._place_mod_dock(x)
+            x.setVisible(k not in self._hidden_docks)
+
+    # [FEATURE 51.12] Eye button menu: checkmark = panel shown; clicking toggles it. Persisted in QSettings "hidden_docks".
+    def show_panels_menu(self, btn):
+        menu = QMenu(self)
+        for key, title in (("project", "Project"), ("preview", "Preview"), ("timeline", "Timeline")):
+            act = menu.addAction(title)
+            act.setCheckable(True)
+            act.setChecked(key not in self._hidden_docks and not self.docks[key].isHidden())
+            act.triggered.connect(lambda on, k=key: self.set_panel_visible(k, on))
+        if self.mod_docks:
+            menu.addSeparator()
+        for key, d in self.mod_docks.items():
+            act = menu.addAction(d.windowTitle())
+            act.setCheckable(True)
+            act.setChecked(key not in self._hidden_docks and not d.isHidden())
+            act.triggered.connect(lambda on, k=key: self.set_panel_visible(k, on))
+        menu.exec(btn.mapToGlobal(QPoint(0, btn.height())))
+
+    def set_panel_visible(self, key, on):
+        d = self.docks.get(key) or self.mod_docks[key]
+        st = QSettings("QuickCut", "QuickCut")
+        if on:
+            self._hidden_docks.discard(key)
+            d.setVisible(True)
+            QTimer.singleShot(0, lambda: self._restore_panel_size(key))
+            QTimer.singleShot(150, lambda: self._restore_panel_size(key))     # again after Qt's own re-layout settles
+        else:
+            if not d.isHidden():
+                self._dock_sizes[key] = (d.width(), d.height())        # [51.13] remember its size for when it comes back
+                st.setValue("dock_sizes", json.dumps(self._dock_sizes))
+            self._hidden_docks.add(key)
+            d.setVisible(False)
+        st.setValue("hidden_docks", sorted(self._hidden_docks))
+
+    # [51.13] Put a re-shown panel back to the size it had: Timeline by height (vertical split with the top row),
+    # Project/Preview by width (horizontal split with each other).
+    def _restore_panel_size(self, key):
+        if key not in self.docks:
+            return
+        sz, d, h = self._dock_sizes.get(key), self.docks[key], self.dock_host
+        if not sz or d.isHidden() or d.isFloating():
+            return
+        w, ht = sz
+        try:
+            if key == "timeline":
+                ref = next((x for x in (self.docks["preview"], self.docks["project"]) if not x.isHidden()), None)
+                if ref is not None:
+                    tot = ref.height() + d.height()
+                    h.resizeDocks([ref, d], [max(1, tot - ht), ht], Qt.Orientation.Vertical)
+                    self._tl_keeper.h = ht
+            else:
+                other = self.docks["preview" if key == "project" else "project"]
+                if not other.isHidden() and not other.isFloating():
+                    tot = other.width() + d.width()
+                    h.resizeDocks([d, other], [w, max(1, tot - w)], Qt.Orientation.Horizontal)
+        except Exception:
+            pass
+
+    # [52.2] "tab" mods: a window like Project/Preview/Timeline. Sits right of Preview in the top row, has a Panel header,
+    # follows the lock/unlock + eye-menu rules. Its position is NOT persisted (re-placed at every start / layout reset).
+    def _place_mod_dock(self, d):
+        h, pv = self.dock_host, self.docks["preview"]
+        h.removeDockWidget(d)
+        h.splitDockWidget(pv, d, Qt.Orientation.Horizontal)
+        w = max(240, d._panel.sizeHint().width())
+        QTimer.singleShot(0, lambda: h.resizeDocks([pv, d], [max(200, pv.width() - w), w], Qt.Orientation.Horizontal)
+                          if not d.isHidden() and not pv.isHidden() else None)
+
+    def add_mod_dock(self, key, title, widget):
+        pn = Panel(title)
+        pn.body_lay.addWidget(widget)
+        d = QDockWidget(title)
+        d.setObjectName("dock_" + key.replace(":", "_").replace(".", "_"))
+        d.setWidget(pn)
+        d._panel = pn
+        d.dockLocationChanged.connect(self._on_dock_moved)
+        d.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        d.customContextMenuRequested.connect(lambda p, d=d: self.layout_menu(d, p))
+        pn.head_lay.parent().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        pn.head_lay.parent().customContextMenuRequested.connect(lambda p, w=pn.head_lay.parent(): self.layout_menu(w, p))
+        d._empty_title = QWidget()
+        d._empty_title.setFixedHeight(0)
+        self.mod_docks[key] = d
+        self._layout_busy = True
+        self._place_mod_dock(d)
+        self._apply_dock_lock()
+        self._layout_busy = False
+        d.setVisible(key not in self._hidden_docks)
+
+    def remove_mod_dock(self, key):
+        d = self.mod_docks.pop(key, None)
+        if d is not None:
+            self.dock_host.removeDockWidget(d)
+            d.setParent(None)
+            d.deleteLater()
+
+    def _apply_dock_lock(self):
+        on = self._layout_unlocked
+        F = QDockWidget.DockWidgetFeature
+        for x in list(self.docks.values()) + list(self.mod_docks.values()):
+            x.setFeatures(F.DockWidgetMovable if on else F.NoDockWidgetFeatures)
+            x.setTitleBarWidget(None if on else x._empty_title)
+        # the Panel headers already show the panel name; hide it while the dock title bar is visible (no duplicate)
+        for pn in (self.proj_panel, self.tl_panel) + tuple(x._panel for x in self.mod_docks.values()):
+            pn.title.setVisible(not on)
+
+    def set_layout_unlocked(self, on):
+        self._layout_unlocked = on
+        self._apply_dock_lock()
+        if not on:
+            self.save_layout()
+        self.statusBar().showMessage("Layout unlocked - drag a panel's title bar to move it (locks after one move)"
+                                     if on else "Layout locked", 5000)
+
+    def _on_dock_moved(self, *_):
+        if self._layout_unlocked and not self._layout_busy:
+            QTimer.singleShot(400, self._relock_after_drop)
+
+    def _relock_after_drop(self):
+        if QApplication.mouseButtons() != Qt.MouseButton.NoButton:     # drag still in progress -> wait
+            QTimer.singleShot(200, self._relock_after_drop)
+            return
+        if self._layout_unlocked:
+            self.set_layout_unlocked(False)
+
+    def reset_layout(self, silent=False):
+        self._layout_busy = True
+        self._layout_unlocked = False
+        self._hidden_docks.clear()
+        self._dock_sizes = {}
+        QSettings("QuickCut", "QuickCut").remove("hidden_docks")
+        QSettings("QuickCut", "QuickCut").remove("dock_sizes")
+        self._default_dock_layout()
+        self._apply_dock_lock()
+        self._layout_busy = False
+        QSettings("QuickCut", "QuickCut").remove("dock_layout")
+        if not silent:
+            self.statusBar().showMessage("Layout reset", 4000)
+
+    def save_layout(self):
+        if self._validate_layout():          # never persist a broken layout
+            QSettings("QuickCut", "QuickCut").setValue("dock_layout", self.dock_host.saveState())
+
+    def layout_menu(self, w, pos):
+        m = QMenu(self)
+        m.addAction("Lock layout" if self._layout_unlocked else "Unlock layout").triggered.connect(
+            lambda: self.set_layout_unlocked(not self._layout_unlocked))
+        m.addAction("Reset layout").triggered.connect(self.reset_layout)
+        m.exec(w.mapToGlobal(pos))
 
     # ------------------------------------------------------------------ UI builders
     def tool_btn(self, name, tip, slot=None, checkable=False):
@@ -267,17 +576,39 @@ class MainWindow(QMainWindow):
         bar.setFixedHeight(40)
         l = QHBoxLayout(bar)
         l.setContentsMargins(14, 0, 12, 0)
-        logo = QLabel("QuickCut")
-        logo.setStyleSheet("font-size: 11pt; font-weight: 700; color: #ffffff;")
-        l.addWidget(logo)
+        prefs = QPushButton("Preferences")      # sits directly below the Video / GIF tabs (old "QuickCut" logo spot)
+        prefs.setToolTip("Open Preferences")
+        prefs.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        prefs.clicked.connect(lambda: PreferencesDialog(self).exec())
+        l.addWidget(prefs)
+        eye = QPushButton()                       # [51.12] show/hide panels
+        eye.setIcon(eye_icon())
+        eye.setIconSize(QSize(20, 20))
+        eye.setToolTip("Show / hide panels")
+        eye.setFixedWidth(34)
+        eye.setFixedHeight(prefs.sizeHint().height())       # [51.13] same height as the neighbouring buttons
+        eye.setStyleSheet("padding: 0px;")
+        eye.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        eye.clicked.connect(lambda: self.show_panels_menu(eye))
+        l.addWidget(eye)
+        help_btn = QPushButton("?")             # [51.8] moved next to Preferences, icon-style
+        help_btn.setObjectName("helpbtn")
+        help_btn.setToolTip("Help")
+        help_btn.setFixedWidth(34)
+        help_btn.setFixedHeight(prefs.sizeHint().height())
+        help_btn.setStyleSheet("padding: 0px; font-weight: 700;")
+        help_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        help_btn.clicked.connect(self.show_help)
+        l.addWidget(help_btn)
+        self.autosave_lbl = QLabel("")            # [52.7] "Auto-Saving N%" - shown by Recovery only while a write runs
+        self.autosave_lbl.setStyleSheet("color:#8f8f8f;font-size:8pt;padding-left:8px;")
+        self.autosave_lbl.hide()
+        l.addWidget(self.autosave_lbl)
         l.addStretch(1)
         self.warnings = WarningBar()
         l.addWidget(self.warnings)
         l.addSpacing(8)
-        help_btn = QPushButton("Help")
-        help_btn.setObjectName("helpbtn")
-        help_btn.clicked.connect(self.show_help)
-        l.addWidget(help_btn)
+        est_idx = l.count()                       # [52.4] the size/time estimate is inserted here (left of the presets)
         self.gif_combo = QComboBox()
         self.gif_combo.setMinimumWidth(190)
         self.gif_combo.setToolTip("GIF export preset: width - fps - lossy level - colors")
@@ -296,7 +627,7 @@ class MainWindow(QMainWindow):
 
         self.hb_check = QCheckBox("Transcode")
         self.hb_check.setToolTip("Re-encode the export with a HandBrake-style preset instead of "
-                                 "QuickCut's default lossless export")
+                                 "SQVCE n4.0's default lossless export")
         self.hb_check.toggled.connect(self._on_hb_toggled)
         self.hb_combo = QComboBox()
         self.hb_combo.setMinimumWidth(190)
@@ -305,9 +636,9 @@ class MainWindow(QMainWindow):
         self.hb_cog.setText("\u2699")
         self.hb_cog.setToolTip("Add / edit your own Transcode presets")
         self.hb_cog.clicked.connect(self.edit_hb_presets)
-        l.addWidget(self.hb_check)
-        l.addWidget(self.hb_combo)
+        l.addWidget(self.hb_combo)                # [52.4] presets appear LEFT of the checkbox so it never moves
         l.addWidget(self.hb_cog)
+        l.addWidget(self.hb_check)
         self._hb_settings = self._gif_settings
         self.reload_hb_combo(self._hb_settings.value("hb_sel", "", str))
         self.hb_combo.currentIndexChanged.connect(
@@ -323,7 +654,7 @@ class MainWindow(QMainWindow):
         self.est_label = QLabel("")
         self.est_label.setStyleSheet("color:#8f8f8f;")
         self.est_label.setToolTip("Rough estimate of the exported file size")
-        l.addWidget(self.est_label)
+        l.insertWidget(est_idx, self.est_label)
         self.export_btn = QPushButton("Export")
         self.export_btn.setObjectName("primary")
         self.export_btn.setToolTip("Export sequence as a new file (Ctrl+M)")
@@ -389,6 +720,7 @@ class MainWindow(QMainWindow):
     # IMPORTANT: Snap and Precise are two checkboxes forced mutually exclusive by another QButtonGroup - exactly one is
     # always on. Precise is turned on last, so the editor STARTS in Precise (Snap off) when ffprobe exists.
     # The camera button grabs the current frame from the sink (untransformed source frame - crop/rotate are not applied).
+
     def build_video_column(self):
         wrap = QWidget()
         vl = QVBoxLayout(wrap)
@@ -422,34 +754,27 @@ class MainWindow(QMainWindow):
         for b in (self.b_sel, self.b_razor, self.b_crop, self.b_resize):
             grp.addButton(b)
             row.addWidget(b)
+        self.plugin_stack = PluginToolStack()       # [52.0] hidden until a "tool" mod is loaded
+        grp.addButton(self.plugin_stack)
+        row.addWidget(self.plugin_stack)
+        self.plugin_stack.hide()
         self.cam_btn = self.tool_btn("camera", "Screenshot current frame", self.take_screenshot)
         row.addWidget(self.cam_btn)
         row.addSpacing(6)
-        self.snap_cb = QCheckBox("Snap")
-        self.snap_cb.setChecked(bool(FFPROBE))
-        self.snap_cb.setEnabled(bool(FFPROBE))
-        self.snap_cb.setToolTip("Snap cuts to keyframes. Lossless cuts can only start on keyframes, so with "
-                                "this on, cut points snap to them and the preview matches the export exactly.\n"
-                                + ("" if FFPROBE else "(ffprobe.exe not found - place it next to this program)"))
-        self.snap_cb.toggled.connect(lambda on: setattr(self.seq, "snap", on))
-        row.addWidget(self.snap_cb)
-        row.addSpacing(6)
-        self.precise_cb = QCheckBox("Precise")
-        self.precise_cb.setChecked(False)
-        self.precise_cb.setEnabled(bool(FFPROBE))
-        self.precise_cb.setToolTip("Trim to any exact frame, not just keyframes. Lets you drag a clip's start "
-                                   "freely; on export, only the small sliver up to the next keyframe gets "
-                                   "re-encoded (fast, barely-visible quality cost) - the rest of every clip "
-                                   "still exports as an untouched, lossless copy.\n"
-                                   + ("" if FFPROBE else "(ffprobe.exe not found - place it next to this program)"))
-        self.precise_cb.toggled.connect(self.on_precise_toggled)
-        self.mode_grp = QButtonGroup(self)                # Snap / Precise: exactly one is always on
-        self.mode_grp.setExclusive(True)
-        self.mode_grp.addButton(self.snap_cb)
-        self.mode_grp.addButton(self.precise_cb)
+        # [51.9] ONE button whose TEXT is the current mode ("Precise" default / "Keyframes"); clicking switches mode.
+        self.mode_btn = QPushButton("Precise")
+        self.mode_btn.setEnabled(bool(FFPROBE))
+        self.mode_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mode_btn.setToolTip("Click to switch trim mode.\n\n"
+                                 "Precise: trim to any exact frame. Export re-encodes a clip only when its start is not on "
+                                 "a keyframe; everything else stays an untouched, lossless copy.\n"
+                                 "Keyframes: cut points snap to keyframes, so the preview matches a fully lossless export "
+                                 "exactly.\n"
+                                 + ("" if FFPROBE else "(ffprobe.exe not found - place it next to this program)"))
+        self.mode_btn.clicked.connect(lambda: self.set_trim_mode(not self.seq.snap))
         if FFPROBE:
-            self.precise_cb.setChecked(True)          # editor starts in Precise mode
-        row.addWidget(self.precise_cb)
+            self.seq.snap, self.seq.precise = False, True      # start in Precise
+        row.addWidget(self.mode_btn)
         row.addStretch(1)
         self.tc_label = QLabel("00:00:00:00")
         self.tc_label.setObjectName("tc")
@@ -475,6 +800,8 @@ class MainWindow(QMainWindow):
     def build_timeline_panel(self):
         p = self.tl_panel = Panel("Timeline")
         self.tl = Timeline(self.seq)
+        self.seq.blocked.connect(lambda k: self.statusBar().showMessage(
+            f"The {k} row is locked - click its lock icon (left of the row) to edit it.", 4000))     # [52.25]
         # [FEATURE] Simple audio VU meter to the left of the timeline, reacting to whatever audio the Engine is
         # currently decoding (Engine.audioLevel -> VUMeter.set_level). Preview/monitoring only - never exported.
         self.vu = VUMeter()
@@ -509,15 +836,17 @@ class MainWindow(QMainWindow):
         p.body_lay.addWidget(nav)
         self.tl.seekRequested.connect(self.on_timeline_seek)
         self.tl.splitRequested.connect(self.split_at)
+        self.tl.blankRequested.connect(self.add_blank_clip)
         self.tl.deleteRequested.connect(self.delete_selected)
         self.tl.copyRequested.connect(self.copy_selected)
+        self.tl.duplicateRequested.connect(self.duplicate_selected)
         self.tl.pasteRequested.connect(self.paste_clip)
         self.tl.clipOptionsRequested.connect(self.edit_clip_options)
         self.tl.filesDropped.connect(self.on_files_dropped)
         self.tl.trimBlocked.connect(
             lambda name: self.statusBar().showMessage(
                 f"Still analyzing {name} for exact cut points - trimming its start will be available in a "
-                f"moment (or turn off Snap to trim freely, at the cost of frame-exact export).", 7000))
+                f"moment (or switch to Precise to trim freely, at the cost of frame-exact export).", 7000))
         return p
 
     # [KNOWN ISSUE F4] These QActions carry the global shortcuts. "Save-Over" (Ctrl+S) is NOT gated by app_mode:
@@ -526,46 +855,93 @@ class MainWindow(QMainWindow):
     # mode leak. Fix: return early in save_over() when app_mode == "GIF" (or disable the action in request_mode).
     # [PITFALL] Shortcut keys are window-wide; new single-letter keys can collide with build_shortcuts below.
     def build_actions(self):
-        """Keyboard-shortcut actions only - no visible menu bar."""
-        def act(text, slot, key):
-            a = QAction(text, self)
-            a.setShortcut(QKeySequence(key))
-            a.triggered.connect(lambda _=False: slot())
-            self.addAction(a)
-            return a
-        act("Import Media", self.import_dialog, "Ctrl+I")
-        act("Save-Over", self.save_over, "Ctrl+S")
-        act("Export", self.export, "Ctrl+M")
-        act("Undo", self.seq.undo, "Ctrl+Z")
-        act("Redo", self.seq.redo, "Ctrl+Shift+Z")
-        act("Add Edit at Playhead", lambda: self.split_at(self.engine.playhead), "Shift+C")
-        act("Copy Clip", self.copy_selected, "Ctrl+C")
-        act("Paste Clip", self.paste_clip, "Ctrl+V")
-        act("Ripple Delete", self.handle_delete_key, "Delete")
-        act("Rename File", self.f2_rename, "F2")
-        act("Quit", self.close, "Ctrl+Q")
+        """[52.0] Every binding is a QShortcut whose key comes from Preferences (utils.KEYBIND_DEFS ids). play_pause,
+        tool_ok and tool_cancel have no QShortcut: keyPressEvent matches them via _key_is (tap/hold logic, tool-only)."""
+        self._bind_fns = {
+            "import": self.import_dialog, "save_over": self.save_over, "export": self.export,
+            "select_all": self._select_all,
+            "undo": self.seq.undo, "redo": self.seq.redo,
+            "split": lambda: self.split_at(self.engine.playhead), "copy": self.copy_selected,
+            "paste": self.paste_clip, "duplicate": self.duplicate_selected, "delete": self.handle_delete_key, "rename": self.f2_rename, "quit": self.close,
+            "tool_select": lambda: (self.b_sel.setChecked(True), self.set_tool("select")),
+            "tool_razor": lambda: (self.b_razor.setChecked(True), self.set_tool("razor")),
+            "tool_crop": lambda: (self.b_crop.setChecked(True), self.set_tool("crop")),
+            "tool_resize": self._r_shortcut,
+            "tool_plugin": lambda: self.plugin_stack.cycle(),
+            "move_left": lambda: self.move_clip(-1), "move_right": lambda: self.move_clip(1),
+            "step_back": lambda: self.step(-1), "step_fwd": lambda: self.step(1),
+            "step_back5": lambda: self.step(-5), "step_fwd5": lambda: self.step(5),
+            "prev_edit": lambda: self.goto_edit(-1), "next_edit": lambda: self.goto_edit(1),
+            "go_start": lambda: self._locked_seek(0.0), "go_end": lambda: self._locked_seek(self.seq.total())}
+        self._shortcuts = {}
+        for kid, fn in self._bind_fns.items():
+            sc = QShortcut(QKeySequence(), self)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(fn)
+            self._shortcuts[kid] = sc
+        self.apply_keybinds()
 
-    # [MAP] Plain-key QShortcuts (tool letters, arrows, Space, Home/End, Alt+arrows to move a clip). Keep the Help text
-    # (show_help) and tool tooltips in sync with any change here.
-    def build_shortcuts(self):
-        def sc(key, fn):
-            QShortcut(QKeySequence(key), self, activated=fn)
-        # Space is handled in keyPressEvent/keyReleaseEvent instead of a QShortcut, so a tap vs. a
-        # hold can be told apart (hold = 2x speed while playing; see SPACE_HOLD_MS).
-        sc("V", lambda: (self.b_sel.setChecked(True), self.set_tool("select")))
-        sc("C", lambda: (self.b_razor.setChecked(True), self.set_tool("razor")))
-        sc("X", lambda: (self.b_crop.setChecked(True), self.set_tool("crop")))
-        sc("R", self._r_shortcut)
-        sc("Alt+Left", lambda: self.move_clip(-1))
-        sc("Alt+Right", lambda: self.move_clip(1))
-        sc("Left", lambda: self.step(-1))
-        sc("Right", lambda: self.step(1))
-        sc("Shift+Left", lambda: self.step(-5))
-        sc("Shift+Right", lambda: self.step(5))
-        sc("Up", lambda: self.goto_edit(-1))
-        sc("Down", lambda: self.goto_edit(1))
-        sc("Home", lambda: self._locked_seek(0.0))
-        sc("End", lambda: self._locked_seek(self.seq.total()))
+    def apply_keybinds(self):
+        self._keys = {k: QKeySequence(v) for k, v in keybind_map().items()}
+        for kid, sc in self._shortcuts.items():
+            sc.setKey(self._keys[kid])
+
+    def _key_is(self, kid, event):
+        from PySide6.QtCore import QKeyCombination
+        ks = self._keys.get(kid)
+        if ks is None or ks.isEmpty():
+            return False
+        mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+        if QKeySequence(QKeyCombination(mods, Qt.Key(event.key()))) == ks:
+            return True
+        return event.key() == Qt.Key.Key_Enter and ks == QKeySequence(QKeyCombination(mods, Qt.Key.Key_Return))
+
+    def apply_prefs(self):
+        """Called by PreferencesDialog on Apply/OK/Reset: theme, keybinds, mods."""
+        app = QApplication.instance()
+        app.setPalette(dark_palette())
+        app.setStyleSheet(build_qss())
+        self.titlebar.restyle()
+        self.apply_keybinds()
+        return self.plugins.sync()          # names of mods that were unloaded (restart needed to fully drop their code)
+
+    def export_default(self, src_path, ext, mode):
+        """[52.0] Default path offered in the Save dialog (default export folder + naming scheme from Preferences)."""
+        s = prefs()
+        folder = os.path.dirname(src_path)
+        d = s.value("pref_export_dir", "", str)
+        if s.value("pref_export_dir_on", False, bool) and d and os.path.isdir(d):
+            folder = d
+        return format_out_name(name_scheme(), src_path, ext, folder, mode)
+
+    def export_beside(self, src_path, ext, mode):
+        """[52.4] Shift+click export: naming scheme, saved next to the source file (ignores the default export location);
+        made unique with _2, _3... if taken."""
+        s = prefs()
+        base, e = os.path.splitext(format_out_name(name_scheme(), src_path, ext,
+                                                   os.path.dirname(src_path), mode))
+        out, n = base + e, 2
+        while os.path.exists(out):
+            out, n = f"{base}_{n}{e}", n + 1
+        return out
+
+    def export_auto(self, src_path, ext, mode):
+        """[52.3] With "Use a default export location" on (and the folder existing): the path to export to WITHOUT asking
+        (scheme name, made unique with _2, _3... so nothing is overwritten). None = ask with the Save dialog as before."""
+        s = prefs()
+        d = s.value("pref_export_dir", "", str)
+        if not (s.value("pref_export_dir_on", False, bool) and d):
+            return None
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            return None
+        base, e = os.path.splitext(self.export_default(src_path, ext, mode))
+        out, n = base + e, 2
+        while os.path.exists(out):
+            out, n = f"{base}_{n}{e}", n + 1
+        self.statusBar().showMessage("Exporting to default location: " + out, 6000)
+        return out
 
     def show_help(self):
         QMessageBox.information(self, "Keyboard shortcuts", (
@@ -574,11 +950,14 @@ class MainWindow(QMainWindow):
             "Up / Down  Previous / next edit\n"
             "Home / End  Go to start / end\n"
             "V  Selection tool     C  Razor / Cut tool\n"
+            "Z  Plugin tool (press again to cycle plugin tools)\n"
             "X  Crop tool     R  Resize tool  (drag corners/sides; right-click the overlay to reset;\n"
             "   press R again while Resize is active to rotate 90\u00b0)\n"
             "Enter / Esc  While Crop/Resize is active: OK / Cancel\n"
             "Shift+C  Add edit (split) at playhead\n"
+            "Ctrl+A  Select all timeline clips  (drag on empty timeline space = selection box, Ctrl = add)\n"
             "Ctrl+C / Ctrl+V  Copy / paste the selected timeline clip\n"
+            "Ctrl+D  Duplicate the selected video / text / audio clip\n"
             "Delete  Remove selected Project item, or ripple-delete selected timeline clip\n"
             "F2  Rename the selected Project file (on disk)\n"
             "Ctrl+Z / Ctrl+Shift+Z  Undo / redo\n"
@@ -588,7 +967,7 @@ class MainWindow(QMainWindow):
             "Drop files onto the Project panel or straight onto the timeline.\n\n"
             "The star on a Project item marks it as the PRIMARY file - click any other "
             "star to change it. Save-Over always overwrites the primary file.\n\n"
-            "Snap keeps trims on keyframes so the preview always matches a fully lossless export.\n"
+            "Keyframes keeps trims on keyframes so the preview always matches a fully lossless export.\n"
             "Precise lets you trim to any frame; export re-encodes only the small sliver that "
             "needs it, keeping the rest of every clip an untouched, lossless copy."))
 
@@ -612,6 +991,24 @@ class MainWindow(QMainWindow):
     # register in medias/by_path/items/rows, start the background MediaWorker, and make the first file primary.
     # Returns the list of Media (existing or new) - callers such as on_files_dropped insert exactly that list.
     # [COUPLING] A new per-media registry must be updated here AND in remove_medias, clear_project and rename_media.
+    # [52.21] Wait for a worker-thread result WITHOUT freezing the window: paints/timers keep running, mouse and keyboard
+    # events are excluded so a click during a long import can no longer re-enter the UI (that was the crash).
+    def _await_fut(self, fut, label):
+        if not fut.done():
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.statusBar().showMessage(f"Importing {label} ...")
+            try:
+                while not fut.done():
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents, 30)
+                    time.sleep(0.01)
+            finally:
+                QApplication.restoreOverrideCursor()
+                self.statusBar().clearMessage()
+        try:
+            return fut.result()
+        except Exception:
+            return None
+
     def import_paths(self, paths):
         out = []
         # [FIX] probe_media() runs synchronously on the GUI thread (up to 25 s/file, see [KNOWN ISSUE F12]).
@@ -625,6 +1022,15 @@ class MainWindow(QMainWindow):
             dlg.setWindowModality(Qt.WindowModality.WindowModal)
             dlg.setMinimumDuration(500)
             dlg.setAutoClose(True)
+        # [PERF] Probe non-image files in parallel (4 ffmpeg -i at a time, no Qt objects touched); the loop below only
+        # collects the results in order, so a big import takes ~1/4 of the time instead of N x latency.
+        from concurrent.futures import ThreadPoolExecutor
+        pool, futs = ThreadPoolExecutor(max_workers=4), {}
+        for p in paths:
+            ap = os.path.abspath(p)
+            if ap not in self.by_path and ap not in futs and os.path.isfile(ap):
+                is_i = os.path.splitext(ap)[1].lower() in IMAGE_EXTS
+                futs[ap] = pool.submit(probe_image if is_i else probe_media, ap)    # [52.21] images bake off the GUI thread
         for i, p in enumerate(paths):
             if dlg is not None:
                 dlg.setValue(i)
@@ -639,16 +1045,9 @@ class MainWindow(QMainWindow):
             if not os.path.isfile(p):
                 continue
             is_img = os.path.splitext(p)[1].lower() in IMAGE_EXTS
-            src_for_probe = p
-            if is_img:
-                clip_path = image_to_clip(p, dur=IMAGE_MAX_DUR)
-                if not clip_path:
-                    self.statusBar().showMessage(f"Could not import image: {os.path.basename(p)}", 6000)
-                    continue
-                src_for_probe = clip_path
-            m = probe_media(src_for_probe)
+            m = self._await_fut(futs[p], os.path.basename(p)) if p in futs else None
             if not m:
-                self.statusBar().showMessage(f"Could not read: {os.path.basename(p)}", 6000)
+                self.statusBar().showMessage(f"Could not {'import image' if is_img else 'read'}: {os.path.basename(p)}", 6000)
                 continue
             if is_img:
                 m.name = os.path.basename(p)   # show the original picture's name in the Project tab
@@ -671,6 +1070,7 @@ class MainWindow(QMainWindow):
             self._size_item(m)
             self.worker.start(m)
             out.append(m)
+        pool.shutdown(wait=False, cancel_futures=True)
         if dlg is not None:
             dlg.setValue(len(paths))
         if out and self.primary is None:
@@ -813,7 +1213,7 @@ class MainWindow(QMainWindow):
                        f"will be cleared.\n\n(Files on disk are not touched.)")
             else:
                 msg = (f"Remove {what} from the project?\n\n"
-                       f"(This only removes it from QuickCut's list - the file on disk is not touched.)")
+                       f"(This only removes it from SQVCE n4.0's list - the file on disk is not touched.)")
             r = QMessageBox.question(
                 self, "Remove from Project", msg,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -896,6 +1296,9 @@ class MainWindow(QMainWindow):
     # otherwise ripple-delete the selected timeline clip. Timeline uses ClickFocus so clicking it moves focus away from
     # the list.
     def handle_delete_key(self):
+        lane_done = [getattr(l, "delete_key", lambda: False)() for l in self.tl.unlocked_lanes()]   # [52.10] selected lane items (text)
+        if any(lane_done) and not (0 <= self.tl.sel < len(self.seq.segs)):
+            return
         if self.plist.hasFocus():
             sel = self.plist.selectedItems()
             if sel:
@@ -917,7 +1320,8 @@ class MainWindow(QMainWindow):
     def clear_project(self):
         if not self.medias and not self.seq.segs:
             return
-        r = QMessageBox.question(
+        shift = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)   # [52.15] Shift = no warning
+        r = QMessageBox.StandardButton.Yes if shift else QMessageBox.question(
             self, "Clear Project", "Remove all clips and clear the timeline?\n\n"
             "Files on disk are not affected.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -941,6 +1345,8 @@ class MainWindow(QMainWindow):
         self.seq.segs = []
         self.seq.undo_stack.clear()
         self.seq.redo_stack.clear()
+        self.atrack.clear()                         # [52.19]
+        self.plugins.broadcast("on_clear")          # [52.11] mods drop their own clips/overlays
         self.tl.sel = -1
         self.tl.thumb_pix.clear()
         self.tl.thumb_pending.clear()
@@ -981,19 +1387,20 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event):
         key = event.key()
         if self.stage.tool is not None and not event.isAutoRepeat():
-            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._key_is("tool_ok", event):
                 self.stage.b_ok.click()
                 event.accept()
                 return
-            if key == Qt.Key.Key_Escape:
+            if self._key_is("tool_cancel", event):
                 self.stage.b_cancel.click()
                 event.accept()
                 return
-        if key == Qt.Key.Key_Space:
+        if self._key_is("play_pause", event):
             if event.isAutoRepeat():
                 event.accept()
                 return
             if not self._tool_locked():
+                self._space_key = key
                 self._space_is_down = True
                 self._space_was_playing = self.engine.playing
                 self._space_boosted = False
@@ -1007,7 +1414,7 @@ class MainWindow(QMainWindow):
 
     def keyReleaseEvent(self, event):
         key = event.key()
-        if key == Qt.Key.Key_Space:
+        if key == getattr(self, "_space_key", None) and self._space_is_down:
             if not event.isAutoRepeat():
                 was_down, self._space_is_down = self._space_is_down, False
                 if was_down and self._space_boosted:
@@ -1034,14 +1441,37 @@ class MainWindow(QMainWindow):
     def goto_edit(self, d):
         if self._tool_locked():
             return
+        if len(self.tl.sel_layers()) > 1:             # [52.21] clips from several layers selected: Up/Down does nothing
+            self.statusBar().showMessage("Up/Down needs the selected clips to be on one layer.", 3000)
+            return
+        for ln in self.tl._all_lanes():               # [52.17] a selected lane clip (text...) navigates within ITS layer
+            f = getattr(ln, "nav_edit", None)
+            t = f(d) if f else None
+            if t is not None:
+                self.engine.seek(t, play=False)
+                return
         bounds = self.seq.starts() + [self.seq.total()]
         t = self.engine.playhead
         if d < 0:
             c = [b for b in bounds if b < t - 0.02]
-            self.engine.seek(max(c) if c else 0.0, play=False)
+            tt = max(c) if c else 0.0
         else:
             c = [b for b in bounds if b > t + 0.02]
-            self.engine.seek(min(c) if c else self.seq.total(), play=False)
+            tt = min(c) if c else self.seq.total()
+        self.engine.seek(tt, play=False)
+        # [52.6] also select the clip that starts at that edit (the last clip when landing on the very end), one at a time
+        n = len(self.seq.segs)
+        if n:
+            self.tl.select_only(min(bisect.bisect_left(self.seq.starts(), tt - 0.001), n - 1))
+
+    # [52.6] Ctrl+A: timeline clips when the timeline has focus / the mouse is over it; otherwise behaves like a normal
+    # "select all" for a focused list (e.g. the Project panel).
+    def _select_all(self):
+        fw = QApplication.focusWidget()
+        if self.tl.underMouse() or fw is self.tl or not isinstance(fw, QListWidget):
+            self.tl.select_all()
+        else:
+            fw.selectAll()
 
     def on_timeline_seek(self, t):
         if self._tool_locked():
@@ -1222,6 +1652,8 @@ class MainWindow(QMainWindow):
     # Crop, show a one-time hint when the clip already has a cropped-away "ghost" area. Non-video clips show a status
     # message but the tool still opens (the stage stays inactive: refresh_stage passes xf=None).
     def set_tool(self, tool):
+        if getattr(self, "plugins", None):
+            self.plugins.deactivate()
         self.tl.set_tool(tool)
         if tool in ("crop", "resize"):
             seg = self.current_seg()
@@ -1261,7 +1693,13 @@ class MainWindow(QMainWindow):
     def edit_clip_options(self, idx):
         if not (0 <= idx < len(self.seq.segs)):
             return
+        if "video" in self.seq.locked:                  # [52.25]
+            self.seq.blocked.emit("video")
+            return
         seg = self.seq.segs[idx]
+        if getattr(seg.media, "blank", False):         # [52.17] blank clip: the only option is its colour
+            self.recolor_blank(seg)
+            return
         dlg = ClipOptionsDialog(self, seg.media.name, seg.mute, seg.speed, bool(seg.media.acodec.strip()),
                                 seg.mirror, seg.media.has_video, seg.rev,
                                 seg.media.audio_streams, seg.atracks, seg.vol_db, seg.track_type)
@@ -1287,24 +1725,51 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Clip options applied - clips with speed / mute / mirror / reverse are "
                                          "re-encoded on export.", 5000)
 
-    # [MAP] Alt+Left/Right: swap the selected clip with its neighbour through Sequence.edit, keep the selection on it,
-    # seek to its start.
+    # [MAP] Alt+Left/Right [52.21]: moves the whole selection ONE spot, as ONE undo step. Same layer: video clips swap past
+    # the neighbouring clip(s); text/audio items hop over the neighbouring item of their layer (hop_sel). Several layers
+    # (box select): the VIDEO selection is the baseline - it hops on the video row and every selected text/audio item is
+    # shifted by the same time delta (shift_sel; refused if it would overlap or leave 0). No video clip selected + several
+    # layers = nothing happens.
     def move_clip(self, d):
-        """Alt+Left / Alt+Right: swap the selected clip with its neighbour (no mouse needed)."""
-        i = self.tl.sel
-        j = i + d
-        segs = self.seq.segs
-        if not (0 <= i < len(segs) and 0 <= j < len(segs)):
+        tl, segs = self.tl, self.seq.segs
+        tl.expand_groups()                          # [52.22] never move part of a group (it would break it apart)
+        layers = tl.sel_layers()
+        if not layers:
+            return
+        vsel = {i for i in tl.multi_sel if 0 <= i < len(segs)} | ({tl.sel} if 0 <= tl.sel < len(segs) else set())
+        lanes = [ln for ln in tl.unlocked_lanes() if getattr(ln, "sel_layers", None) and ln.sel_layers()]   # [52.25]
+        if not vsel:
+            if len(layers) > 1 or not lanes:
+                self.statusBar().showMessage("Alt+Left/Right needs the selection to be on one layer (or include a video clip).", 4000)
+                return
+            self.engine.pause()
+            self.seq.edit(lambda: bool(lanes[0].hop_sel(d)), layer=None)      # [52.25] lane items only
+            tl.update()
+            return
+        n, flags, ns = len(segs), [i in vsel for i in range(len(segs))], list(segs)
+        if (d < 0 and min(vsel) == 0) or (d > 0 and max(vsel) == n - 1):
+            return
+        for i in (range(1, n) if d < 0 else range(n - 2, -1, -1)):
+            a, b = (i - 1, i) if d < 0 else (i, i + 1)
+            if flags[b if d < 0 else a] and not flags[a if d < 0 else b]:
+                ns[a], ns[b], flags[a], flags[b] = ns[b], ns[a], flags[b], flags[a]
+        new = [i for i, f in enumerate(flags) if f]
+        dt = sum(s.dur for s in ns[:new[0]]) - self.seq.starts()[min(vsel)]
+        if lanes and not all(ln.shift_sel(dt, True) for ln in lanes):
+            self.statusBar().showMessage("Can't move the group there - a text/audio clip would overlap another one.", 4000)
             return
         self.engine.pause()
 
         def do():
-            segs[i], segs[j] = segs[j], segs[i]
+            segs[:] = ns
+            getattr(self.seq, "_invalidate_geometry", lambda: None)()
+            for ln in lanes:
+                ln.shift_sel(dt)
             return True
         self.seq.edit(do)
-        self.tl.sel = j
-        self.engine.seek(self.seq.starts()[j], play=False)
-        self.tl.update()
+        tl.multi_sel, tl.sel = set(new), new[0]
+        self.engine.seek(self.seq.starts()[new[0]], play=False)
+        tl.update()
 
     # [MAP] Adds 90 degrees clockwise to the clip under the PLAYHEAD (current_seg), through Sequence.edit. Shown live in
     # the preview; exported by _fx_args (transpose). Reached from the Resize tool's rotate button (rotateRequested).
@@ -1396,18 +1861,13 @@ class MainWindow(QMainWindow):
         base = os.path.splitext(parts[0][0].path)[0]
         # [FIX B5] Shift+click also skips the save dialog in GIF mode, same as the normal video export path.
         if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
-            folder = os.path.dirname(parts[0][0].path)
-            n = 1
-            while True:
-                cand = os.path.join(folder, f"edit{n}.gif")
-                if not os.path.exists(cand):
-                    out = cand
-                    break
-                n += 1
+            out = self.export_beside(parts[0][0].path, ".gif", "GIF")
         else:
-            out, _ = QFileDialog.getSaveFileName(self, "Export GIF", base + "_edit.gif", "GIF (*.gif)")
+            out = self.export_auto(parts[0][0].path, ".gif", "GIF")
             if not out:
-                return
+                out, _ = QFileDialog.getSaveFileName(self, "Export GIF", self.export_default(parts[0][0].path, ".gif", "GIF"), "GIF (*.gif)")
+                if not out:
+                    return
         if not out.lower().endswith(".gif"):
             out += ".gif"
 
@@ -1415,7 +1875,7 @@ class MainWindow(QMainWindow):
             if ok:
                 note = ""
                 if preset["lossy"] > 0 and not find_tool("gifsicle"):
-                    note = "\n\n(gifsicle not found - lossy was approximated. Put gifsicle.exe next to QuickCut for true lossy compression.)"
+                    note = "\n\n(gifsicle not found - lossy was approximated. Put gifsicle.exe next to SQVCE n4.0 for true lossy compression.)"
                 self.statusBar().showMessage(f"Exported: {msg}", 10000)
                 ExportDoneDialog(self, msg, note).exec()
             elif msg == "Cancelled":
@@ -1430,25 +1890,13 @@ class MainWindow(QMainWindow):
     # Switching toggles: GIF combo+cog visible, Save-Over BUTTON hidden [but see F4], Transcode controls hidden,
     # estimates refreshed. app_mode is a plain string ("Video"/"GIF") read by est_*, export and _on_hb_toggled.
     def request_mode(self, name):
+        self.plugins.mode_left()                # [52.24] tell the mod mode we are leaving (before the page switch)
+        self.page_stack.setCurrentIndex(0)      # leave any mod tab
         if name == self.app_mode:
             self.titlebar.set_mode(self.app_mode)
             return
-        keep = True
+        keep = True                              # [52.4] no confirmation dialogs; the timeline is always kept
         SB = QMessageBox.StandardButton
-        if name == "GIF" and self.seq.segs:
-            r = QMessageBox.question(self, "Switch to GIF mode",
-                                     "Switch to GIF mode?\n\nKeep the current timeline?\n"
-                                     "Yes = keep it, No = clear it (your files stay in the Project panel).",
-                                     SB.Yes | SB.No | SB.Cancel, SB.Yes)
-            if r == SB.Cancel:
-                self.titlebar.set_mode(self.app_mode)         # put the highlight back
-                return
-            keep = r == SB.Yes
-        elif name != "GIF":
-            r = QMessageBox.question(self, f"Switch to {name} mode", "Switch to Video mode?", SB.Yes | SB.No, SB.No)
-            if r != SB.Yes:
-                self.titlebar.set_mode(self.app_mode)
-                return
         self.app_mode = name
         self.titlebar.set_mode(name)
         self.gif_combo.setVisible(name == "GIF")
@@ -1547,6 +1995,11 @@ class MainWindow(QMainWindow):
     # [MAP] Sets Sequence.precise (Snap is toggled by its own lambda through the exclusive group) and shows the
     # explanatory hint. [KNOWN ISSUE F1] The hint - like the Help text and tooltip - says only "the small sliver"
     # is re-encoded; in reality the entire clip is re-encoded when its start is off-keyframe.
+    def set_trim_mode(self, keyframes):
+        self.seq.snap = bool(keyframes)
+        self.mode_btn.setText("Keyframes" if keyframes else "Precise")
+        self.on_precise_toggled(not keyframes)
+
     def on_precise_toggled(self, on):
         self.seq.precise = on
         if on:
@@ -1614,6 +2067,20 @@ class MainWindow(QMainWindow):
     # updates the resize cursor on mouse-move.
     def eventFilter(self, obj, ev):
         et = ev.type()
+        if et in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease) and isinstance(obj, QWidget) \
+                and obj is QApplication.focusWidget() and obj.window() is self:
+            # [52.15] A focused button/list/checkbox swallowed Space ("sometimes doesn't play"): route it to the window,
+            # except while typing in a text field.
+            from PySide6.QtWidgets import QAbstractSpinBox, QPlainTextEdit, QTextEdit
+            typing = isinstance(obj, (QLineEdit, QAbstractSpinBox, QPlainTextEdit, QTextEdit)) or \
+                (isinstance(obj, QComboBox) and obj.isEditable())
+            if not typing:
+                if et == QEvent.Type.KeyPress and self._key_is("play_pause", ev):
+                    self.keyPressEvent(ev)
+                    return True
+                if et == QEvent.Type.KeyRelease and ev.key() == getattr(self, "_space_key", None) and self._space_is_down:
+                    self.keyReleaseEvent(ev)
+                    return True
         if et == QEvent.Type.MouseButtonPress and ev.button() == Qt.MouseButton.LeftButton:
             edges = self._resize_edges(ev.globalPosition().toPoint())
             if edges:
@@ -1661,8 +2128,18 @@ class MainWindow(QMainWindow):
     # in ONE undo step; then select the last inserted clip, fit the zoom if the timeline was empty, and seek to the end
     # of what was inserted. Used by Project double-click / context menu / file drops.
     def insert_media(self, medias, t=None, tol=0.1):
+        aud = [m for m in medias if is_audio_media(m)]       # [52.19] audio files -> audio track above the video row
+        if aud:
+            if "audio" in self.seq.locked:                   # [52.25]
+                self.seq.blocked.emit("audio")
+            else:
+                self.atrack.add(aud, self.engine.playhead if t is None else t)
+            medias = [m for m in medias if m not in aud]
+            if not medias:
+                return
         was_empty = not self.seq.segs
-        t = self.engine.playhead if t is None else t
+        keep = self.engine.playhead                      # [52.12] playhead stays where it was
+        t = keep if t is None else t
         result = {}
 
         def do():
@@ -1678,7 +2155,54 @@ class MainWindow(QMainWindow):
         self.tl.sel = result.get("idx", -1)
         if was_empty:
             self.tl.zoom_fit(animate=False)
-        self.engine.seek(result.get("end", 0.0), play=False)
+        self.engine.seek(keep, play=False)
+
+    # [52.17] Blank clip = a baked solid-colour video (probing.blank_clip) wrapped in a Media with blank=True. It is NOT
+    # registered in medias/by_path (no Project row); one Media per colour, shared by all clips of that colour.
+    def _blank_media(self, color):
+        w = h = 0
+        for s in self.seq.segs:
+            if s.media.has_video and s.media.w and s.media.h:
+                w, h = s.media.w, s.media.h
+                break
+        w, h = (w, h) if w and h else (1280, 720)
+        key = (color.lower(), w, h)
+        cache = self.__dict__.setdefault("_blank_cache", {})
+        m = cache.get(key)
+        if m is None:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                path = blank_clip(color, w, h)
+            finally:
+                QApplication.restoreOverrideCursor()
+            m = probe_media(path) if path else None
+            if not m:
+                self.statusBar().showMessage("Could not create a blank clip (ffmpeg missing?)", 6000)
+                return None
+            m.name, m.blank, m.color = "Blank", True, QColor(color).name()
+            m.fps = next((s.media.fps for s in self.seq.segs if not getattr(s.media, "blank", False)), 30.0)   # export bakes at this fps
+            m.mark_in, m.mark_out = 0.0, min(4.0, m.dur)
+            m.keyframes = [i / 30.0 for i in range(int(m.dur * 30) + 1)]
+            cache[key] = m
+        return m
+
+    def add_blank_clip(self, t):
+        m = self._blank_media("#000000")
+        if m:
+            self.insert_media([m], t, tol=8 / self.tl.pps)
+
+    def recolor_blank(self, seg):
+        c = QColorDialog.getColor(QColor(seg.media.color), self, "Blank clip color")
+        if not c.isValid() or c.name() == seg.media.color:
+            return
+        m = self._blank_media(c.name())
+        if not m:
+            return
+
+        def do():
+            seg.media = m
+            return True
+        self.seq.edit(do)
 
     def on_files_dropped(self, paths, t):
         medias = self.import_paths(paths)
@@ -1727,12 +2251,41 @@ class MainWindow(QMainWindow):
                               s.atracks, s.vol_db, s.track_type)
         self.statusBar().showMessage(f"Copied {s.media.name} ({fmt_tc(s.dur, self.seq.fps())})", 3000)
 
+    # [52.20] Ctrl+D. A selected lane clip (text / audio) duplicates itself (lane.duplicate_key); otherwise the selected
+    # video clip(s) are copied right after the last selected one (magnetic: everything after ripples).
+    def duplicate_selected(self):
+        fw = QApplication.focusWidget()
+        if isinstance(fw, (QLineEdit, QSpinBox, QDoubleSpinBox)) or hasattr(fw, "toPlainText") or self._tool_locked():
+            return
+        for ln in self.tl.unlocked_lanes():                  # [52.25] locked rows are skipped
+            f = getattr(ln, "duplicate_key", None)
+            if f and f():
+                return
+        segs = self.seq.segs
+        idxs = sorted(i for i in (self.tl.multi_sel or {self.tl.sel}) if 0 <= i < len(segs))
+        if not idxs:
+            self.statusBar().showMessage("Select a clip first, then Ctrl+D.", 3000)
+            return
+        keep, res = self.engine.playhead, {}
+
+        def do():
+            cp = [Seg(s.media, s.in_s, s.out_s, s.xf, s.mute, s.speed, s.mirror, s.rot, s.rev, None, s.atracks, s.vol_db,
+                      s.track_type) for s in (segs[i] for i in idxs)]
+            segs[idxs[-1] + 1:idxs[-1] + 1] = cp
+            res["new"] = set(range(idxs[-1] + 1, idxs[-1] + 1 + len(cp)))
+            return True
+        self.seq.edit(do)
+        self.tl.multi_sel, self.tl.sel = res["new"], min(res["new"])
+        self.tl._invalidate_content()
+        self.engine.seek(keep, play=False)
+        self.statusBar().showMessage("Duplicated clip" if len(idxs) == 1 else f"Duplicated {len(idxs)} clips", 3000)
+
     def paste_clip(self):
         if not self.clipboard_seg:
             self.statusBar().showMessage("Nothing to paste - select a clip and press Ctrl+C first.", 4000)
             return
         media, a, b, xf, mute, speed, mirror, rot, rev, atracks, vol_db, track_type = self.clipboard_seg
-        t = self.engine.playhead
+        t = keep = self.engine.playhead
         was_empty = not self.seq.segs
         result = {}
 
@@ -1747,7 +2300,7 @@ class MainWindow(QMainWindow):
         self.tl.sel = result["idx"]
         if was_empty:
             self.tl.zoom_fit(animate=False)
-        self.engine.seek(result["end"], play=False)
+        self.engine.seek(keep, play=False)
         self.statusBar().showMessage("Pasted clip", 3000)
 
     # ------------------------------------------------------------------ export / save-over
@@ -1830,18 +2383,13 @@ class MainWindow(QMainWindow):
         ext = ("." + transcode["format"]) if transcode else os.path.splitext(first.path)[1]
         filt = f"Video (*{ext})" if transcode else f"Video (*{ext});;All files (*.*)"
         if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
-            folder = os.path.dirname(first.path)
-            n = 1
-            while True:
-                cand = os.path.join(folder, f"edit{n}{ext}")
-                if not os.path.exists(cand):
-                    out = cand
-                    break
-                n += 1
+            out = self.export_beside(first.path, ext, "Video")
         else:
-            out, _ = QFileDialog.getSaveFileName(self, "Export sequence", base + "_edit" + ext, filt)
+            out = self.export_auto(first.path, ext, "Video")
             if not out:
-                return
+                out, _ = QFileDialog.getSaveFileName(self, "Export sequence", self.export_default(first.path, ext, "Video"), filt)
+                if not out:
+                    return
         if not transcode and not os.path.splitext(out)[1]:
             out += ext
         elif transcode and not out.lower().endswith(ext):
@@ -1972,17 +2520,19 @@ class MainWindow(QMainWindow):
     # block closing while one runs - not verified).
     def closeEvent(self, e):
         self.engine.pause()
-        if self.seq.segs:
-            r = QMessageBox.question(self, "Close QuickCut", "There are clips on the timeline.\n\nClose the program anyway?",
+        if self.seq.segs and not (QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier):   # [52.15] Shift+click X = no warning
+            r = QMessageBox.question(self, "Close " + APP_NAME, "There are clips on the timeline.\n\nClose the program anyway?",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                      QMessageBox.StandardButton.No)
             if r != QMessageBox.StandardButton.Yes:
                 e.ignore()
                 return
+        self.save_layout()
         self.engine.player.stop()
         self.engine.player.setSource(QUrl())
         self.proxy.shutdown()
         super().closeEvent(e)
+        self.recovery.shutdown_clean()        # [52.7] normal exit: the recovery file is no longer needed
 
 
 # [MAP] Entry point: Fusion style + dark palette + QSS, then MainWindow with any existing file paths from argv

@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QListWidgetItem, QFileDialog, QMessageBox, QScrollBar, QSlider,
                                QMenu, QCheckBox, QFrame, QProgressDialog, QButtonGroup,
                                QAbstractItemView, QInputDialog, QLineEdit, QDialog, QDoubleSpinBox,
-                               QGraphicsView, QGraphicsScene, QComboBox, QSpinBox, QGridLayout, QSizePolicy,
+                               QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QComboBox, QSpinBox, QGridLayout, QSizePolicy,
                                QColorDialog)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget, QGraphicsVideoItem
@@ -348,6 +348,13 @@ class VideoView(QGraphicsView):
         self.setScene(self._scene)
         self.item = QGraphicsVideoItem()
         self._scene.addItem(self.item)
+        # [PERF] Standby video surface for gapless clip switches (Engine preloads the NEXT clip into a second
+        # QMediaPlayer that renders here, hidden, then swap_items() makes it the visible/active one). `item` always
+        # means "the active surface" (videoSink(), _relayout and the freeze overlay all follow it); both items get
+        # identical geometry/transform so a swap is visually seamless.
+        self.item2 = QGraphicsVideoItem()
+        self._scene.addItem(self.item2)
+        self.item2.setVisible(False)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -358,9 +365,56 @@ class VideoView(QGraphicsView):
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
         self._ar = Qt.AspectRatioMode.KeepAspectRatio
         self._lay = None            # None = plain fit; else (pre_canvas_wh, pic_xywh, rot, mirror) in px
+        # [FIX] Held-frame overlay: QMediaPlayer pushes an EMPTY frame to the sink whenever the source changes
+        # (clip boundary, scrub-proxy <-> source swap), which showed as a black flash while scrubbing. Engine
+        # grabs the last valid frame into this pixmap item just before the switch (freeze) and removes it once the
+        # new source shows a real frame (thaw). It sits above the video item and mirrors its geometry/transform.
+        self._frz = QGraphicsPixmapItem()
+        self._frz.setZValue(10)
+        self._frz.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self._frz.hide()
+        self._scene.addItem(self._frz)
+        self._frz_wh = (0, 0)
 
     def videoSink(self):
         return self.item.videoSink()
+
+    def is_frozen(self):
+        return self._frz.isVisible()
+
+    def freeze(self, img):
+        """Show `img` (QImage of the last good frame) over the video until thaw()."""
+        if img is None or img.isNull():
+            return False
+        if img.width() > 960:
+            img = img.scaledToWidth(960, Qt.TransformationMode.FastTransformation)
+        self._frz.setPixmap(QPixmap.fromImage(img))
+        self._frz_wh = (img.width(), img.height())
+        self._frz.show()
+        self._place_freeze()
+        return True
+
+    def thaw(self):
+        self._frz.hide()
+        self._frz.setPixmap(QPixmap())      # release the held frame's memory
+        self._frz_wh = (0, 0)
+
+    def _place_freeze(self):
+        iw, ih = self._frz_wh
+        if not self._frz.isVisible() or iw <= 0 or ih <= 0:
+            return
+        it = self.item
+        W, H = it.size().width(), it.size().height()
+        if it.aspectRatioMode() == Qt.AspectRatioMode.KeepAspectRatio:
+            s = min(W / iw, H / ih)
+            w, h = iw * s, ih * s
+        else:
+            w, h = W, H
+        t = QTransform()
+        t.translate((W - w) / 2.0, (H - h) / 2.0)
+        t.scale(w / iw, h / ih)
+        self._frz.setPos(it.pos())
+        self._frz.setTransform(t * it.transform())
 
     def set_bg_color(self, color):
         """Blank/background color shown behind the picture (letterbox bars, un-crop ghost, resize
@@ -381,10 +435,21 @@ class VideoView(QGraphicsView):
         super().resizeEvent(e)
         self._relayout()
 
+    def swap_items(self):
+        """Make the standby item the visible/active one (and the old active one the hidden standby)."""
+        self.item, self.item2 = self.item2, self.item
+        self.item.setVisible(True)
+        self.item2.setVisible(False)
+        self._relayout()
+
     def _relayout(self):
         w, h = max(1, self.width()), max(1, self.height())
         self._scene.setSceneRect(0, 0, w, h)
-        it = self.item
+        for it in (self.item, self.item2):
+            self._layout_item(it, w, h)
+        self._place_freeze()
+
+    def _layout_item(self, it, w, h):
         if self._lay is None:
             it.setTransform(QTransform())
             it.setPos(0, 0)
