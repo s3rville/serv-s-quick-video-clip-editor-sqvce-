@@ -147,6 +147,7 @@ class Timeline(QWidget):
         self.vtrack = None               # [52.27] overlay video tracks (video_track.VideoTrack) while Advanced is on
         self.atrack = None               # [52.19] audio track strip ABOVE the clip row (audio_track.AudioTrack)
         self._lane_grab = None
+        self.ghost = None                # [52.36] cross-row drag feedback (dict: rect/target/new/ok/label/color) painted over the content
         self.V_H = self.V_H_FULL
         self.setMinimumHeight(int((self.V_Y + self.V_H_FULL + 8) * self.MIN_H_FRAC))
         self.setFont(QFont("Segoe UI", 8))
@@ -365,7 +366,12 @@ class Timeline(QWidget):
             y0 = self.RULER_H + 2
             for i, (lb, yo, h) in enumerate(at.track_rows(self)):
                 out.append(("audio", lb, y0 + yo, int(h), at, i))
-        out.append(("video", "Video", self.V_Y, int(self.V_H), self.vtrack, 0))   # [52.27] own = overlay tracks -> "+" here
+        vt = self.vtrack
+        if vt and vt.height(self):                                  # [52.29] overlay tracks sit ABOVE the base Video row
+            y0 = self.strip_y(vt)
+            for i, (lb, yo, h) in enumerate(vt.track_rows(self)):
+                out.append((self.lane_key(vt), lb, y0 + yo, int(h), vt, i))
+        out.append(("video", "Video", self.V_Y, int(self.V_H), vt, 0))   # [52.27] own = overlay tracks -> "+" here
         y = self.lane_y()
         for ln in self.lanes:
             h = int(ln.height(self))
@@ -408,7 +414,7 @@ class Timeline(QWidget):
         p.drawLine(QLineF(hw - 0.5, 0, hw - 0.5, H))
         for key, label, y, h, own, idx in self.rows_ex():
             locked = key in self.seq.locked
-            plus = own is not None and idx == 0 and getattr(own, "header_plus", True)
+            plus = own is not None and idx == 0 and (key == "video" or getattr(own, "header_plus", True))   # [52.29] "+" on the base row
             tw = hw - (46 if plus else 30)
             p.fillRect(QRectF(1, y, hw - 3, h), QColor("#2c2c2c"))
             p.setPen(QColor("#6f6f6f" if locked else "#cfcfcf"))
@@ -440,11 +446,22 @@ class Timeline(QWidget):
     def top_h(self):
         return int(self.atrack.height(self)) if self.atrack else 0
 
+    # [52.29] STRIPS above the clip row, top to bottom: audio strip (atrack), then the overlay video tracks (vtrack) directly above
+    # the base Video row. strip_y(ln) = y of the first pixel row of that strip.
+    def vtop_h(self):
+        return int(self.vtrack.height(self)) if self.vtrack else 0
+
+    def strip_y(self, ln):
+        return self.RULER_H + 2 + (self.top_h() if ln is self.vtrack else 0)
+
+    def strips(self):
+        return [ln for ln in (self.atrack, self.vtrack) if ln is not None]
+
     def _all_lanes(self):
-        return self.lanes + ([self.atrack] if self.atrack else [])
+        return self.lanes + self.strips()
 
     def refresh_lanes(self):
-        self.V_Y = self.RULER_H + 3 + self.top_h()          # [52.19] clip row moves down under the audio strip
+        self.V_Y = self.RULER_H + 3 + self.top_h() + self.vtop_h()   # [52.19] clip row moves down under the audio strip ([52.29] and the overlay tracks)
         lh = self.lane_h()
         self.setMinimumHeight(int((self.V_Y + self.V_H_FULL + 8) * self.MIN_H_FRAC) + lh)
         self.V_H = max(self.BAND_H + 1, min(self.V_H_FULL, self.height() - self.V_Y - 8 - lh))
@@ -627,7 +644,7 @@ class Timeline(QWidget):
                     if self._lock_rect(ry, rh).adjusted(-5, -5, 5, 5).contains(pos):
                         self.toggle_lock(key)
                         break
-                    if own is not None and idx == 0 and getattr(own, "header_plus", True) and self._plus_rect(ry, rh).adjusted(-4, -4, 4, 4).contains(pos):
+                    if own is not None and idx == 0 and (key == "video" or getattr(own, "header_plus", True)) and self._plus_rect(ry, rh).adjusted(-4, -4, 4, 4).contains(pos):
                         if self.lane_locked(own):
                             self.seq.blocked.emit(str(key))
                         else:
@@ -648,16 +665,19 @@ class Timeline(QWidget):
                             own.remove_track(idx)
                         break
             return
-        if (self.atrack and self.atrack.height(self) and self.RULER_H <= y < self.V_Y and x >= self.HW
-                and e.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton)):
-            if "audio" in self.seq.locked:                   # [52.25] locked audio strip: clicks do nothing
-                return
-            if self.atrack.press(e, self):               # [52.19] audio strip above the clip row
-                if not self._keep_vsel:
-                    self.sel, self.multi_sel = -1, set()
-                self._invalidate_content()
-                self._lane_grab = self.atrack if e.button() == Qt.MouseButton.LeftButton else None
-                return
+        if x >= self.HW and e.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+            for st in self.strips():                         # [52.19] audio strip / [52.29] overlay video tracks above the clip row
+                y0 = self.strip_y(st)
+                if not (st.height(self) and y0 <= y < y0 + st.height(self)):
+                    continue
+                if self.lane_locked(st):                     # [52.25] locked strip: clicks do nothing
+                    return
+                if st.press(e, self):
+                    if not self._keep_vsel:
+                        self.sel, self.multi_sel = -1, set()
+                    self._invalidate_content()
+                    self._lane_grab = st if e.button() == Qt.MouseButton.LeftButton else None
+                    return
         if self.lanes and y > self.V_Y + self.V_H and x >= self.HW and e.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
             ly = self.lane_y()
             for ln in self.lanes:                            # [52.25] a click on a locked lane's rows is swallowed
@@ -671,15 +691,15 @@ class Timeline(QWidget):
                 if ln.press(e, self):
                     if not self._keep_vsel:
                         self.sel, self.multi_sel = -1, set()  # [52.14] one selection across all layers
-                        if self.atrack:
-                            self.atrack.clear_sel(self)
+                        for st in self.strips():
+                            st.clear_sel(self)
                     self._invalidate_content()
                     self._lane_grab = ln if e.button() == Qt.MouseButton.LeftButton else None
                     return
         h0, _e0 = self.hit(pos)
         keep_l = bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier) or (
             e.button() == Qt.MouseButton.RightButton and h0 is not None and h0 in self.multi_sel)
-        if (self.lanes or self.atrack) and not keep_l:
+        if (self.lanes or self.strips()) and not keep_l:
             for ln in self._all_lanes():                   # a click outside the lanes drops their selection
                 getattr(ln, "clear_sel", lambda tl: None)(self)
         if e.button() == Qt.MouseButton.RightButton:
@@ -823,6 +843,7 @@ class Timeline(QWidget):
             # [FIX B3] _grab is the mouse's pixel offset from the LEFT EDGE OF THE WHOLE DRAGGED BLOCK, fixed at
             # HALF the block's own width - not at wherever inside it was clicked - so the block's CENTRE tracks
             # the mouse for the whole drag, regardless of which clip/spot inside it was grabbed.
+            self._mv_orig = list(self.seq.segs)                # [52.35] original order: a drop onto an overlay row restores it first
             self._mv_t0 = sum(q.dur for q in self.seq.segs[:min(self._move_set)])     # [52.22] lane members follow on release
             bundle_dur = sum(self.seq.segs[k].dur for k in self._move_set)
             self._grab = bundle_dur * self.pps / 2
@@ -869,6 +890,7 @@ class Timeline(QWidget):
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)   # drag is actually starting now
             self._mx = x
             self._move(x)
+            self._ghost_base(pos)
         else:
             if self.tool == "razor":
                 self.setCursor(Qt.CursorShape.CrossCursor)
@@ -894,23 +916,27 @@ class Timeline(QWidget):
     # [INVARIANT] The single place where a drag becomes an undo step: compares the live snapshot with _snap0 and
     # commits only if something really changed (a click without movement creates no undo entry).
     def mouseReleaseEvent(self, e):
+        self.ghost = None
         self._move_timer.stop()
         self._flush_move()      # apply the final mouse position before the drag is committed
         if self._lane_grab is not None:
             g, self._lane_grab = self._lane_grab, None
             g.release(e, self)
             return
+        sent = self.mode == "move" and self._drop_on_overlay(e)
+        if sent:
+            self.mode = None
         if self.mode == "move" and self._move_set and getattr(self, "_mv_t0", None) is not None:
             dt = sum(q.dur for q in self.seq.segs[:min(self._move_set)]) - self._mv_t0
             if abs(dt) > 1e-6:                             # [52.22] selected text/audio group members shift with the block
                 for ln in self._all_lanes():
                     if getattr(ln, "sel_items", None) and ln.sel_items():
                         ln.shift_sel(dt)
-        if self.mode in ("trim_in", "trim_out", "move"):
+        if self.mode in ("trim_in", "trim_out", "move") and not sent:
             if self.seq.snapshot() != self._snap0:
                 self.seq.commit(self._snap0)
                 self.seq.edited.emit()
-        if self.mode in ("move", "pan"):
+        if self.mode in ("move", "pan") or sent:
             self.setCursor(Qt.CursorShape.ArrowCursor)
         self.mode = None
         self._marq = None
@@ -954,11 +980,13 @@ class Timeline(QWidget):
     def mouseDoubleClickEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton or self.tool == "razor":
             return
-        if self.atrack and self.atrack.height(self) and self.RULER_H <= e.position().y() < self.V_Y:
-            if "audio" in self.seq.locked:                # [52.25]
-                return
-            if self.atrack.dbl(e, self):                  # [52.19] audio-only clip options
-                return
+        for st in self.strips():
+            y0 = self.strip_y(st)
+            if st.height(self) and y0 <= e.position().y() < y0 + st.height(self):
+                if self.lane_locked(st):                  # [52.25]
+                    return
+                if st.dbl(e, self):                       # [52.19] audio-only clip options / [52.29] overlay clip options
+                    return
         if self.lanes and e.position().y() > self.V_Y + self.V_H:
             for ln in self.lanes:
                 if not self.lane_locked(ln) and ln.dbl(e, self):
@@ -1085,6 +1113,47 @@ class Timeline(QWidget):
         self.update()
         e.acceptProposedAction()
 
+    # [52.35] Advanced: a base-row clip dragged UP onto an overlay row (or just above the top one = new track) becomes an overlay
+    # clip there (VideoTrack.send_seg). Returns True when it handled the drop (the base order is restored first, so the whole
+    # thing is ONE undo step made by send_seg). A refused send (locked / not a plain clip) leaves the clip where it was.
+    def _ghost_base(self, pos):
+        """[52.36] While a base-row clip is dragged up into the overlay strip, show it under the mouse + the target row."""
+        self.ghost = None
+        vt = self.vtrack
+        if (vt is None or not vt.enabled or len(self._move_set) != 1 or "video" in self.seq.locked or self.lane_locked(vt)
+                or self._move_set[0] >= len(self.seq.segs) or pos.x() < self.HW):
+            return
+        y0, py = self.strip_y(vt), pos.y()
+        if not (y0 - 20 <= py < self.V_Y - 3):
+            return
+        seg = self.seq.segs[self._move_set[0]]
+        new = py < y0
+        r = max(0, min(vt.ntracks - 1, int((py - y0) // (vt.H + 3)))) if vt.ntracks else 0
+        tgt = QRectF(self.HW, y0 - 4, self.width() - self.HW, 6) if (new or not vt.ntracks) else QRectF(self.HW, y0 + r * (vt.H + 3), self.width() - self.HW, vt.H)
+        w = max(8.0, seg.dur * self.pps)
+        self.ghost = {"rect": QRectF(pos.x() - self._grab, py - vt.H / 2.0, w, vt.H), "target": tgt, "new": new or not vt.ntracks,
+                      "label": seg.media.name, "color": self._clip_colors(seg)[0].name()}
+
+    def _drop_on_overlay(self, e):
+        vt, pos = self.vtrack, e.position()
+        orig = getattr(self, "_mv_orig", None)
+        if (vt is None or not vt.enabled or orig is None or len(self._move_set) != 1 or "video" in self.seq.locked
+                or pos.x() < self.HW or self.lane_locked(vt)):
+            return False
+        y0, py = self.strip_y(vt), pos.y()
+        if not (y0 - 20 <= py < self.V_Y - 3):
+            return False
+        seg = self.seq.segs[self._move_set[0]] if self._move_set[0] < len(self.seq.segs) else None
+        if seg is None or seg not in orig:
+            return False
+        track = "new" if py < y0 else vt.row_track(max(0, min(vt.ntracks - 1, int((py - y0) // (vt.H + 3)))))
+        idx, t = orig.index(seg), max(0.0, self.xt(pos.x() - self._grab))
+        self.seq.segs[:] = orig
+        self.multi_sel, self.sel, self._mv_orig = set(), -1, None
+        self.seq.live.emit()
+        vt.send_seg(idx, track, t)
+        return True
+
     def dragLeaveEvent(self, e):
         self.drop_x = None
         self.update()
@@ -1192,9 +1261,9 @@ class Timeline(QWidget):
         p.setClipRect(hw, 0, W - hw, H)
         self._paint_ruler(p, W)
         self._paint_clips(p)
-        if self.atrack:
+        for st in self.strips():
             try:
-                self.atrack.paint(p, self, self.RULER_H + 2, W)
+                st.paint(p, self, self.strip_y(st), W)
             except Exception:
                 pass
         y = self.lane_y()
@@ -1239,6 +1308,26 @@ class Timeline(QWidget):
         if self.drop_x is not None:
             p.setPen(QPen(QColor("#ffb020"), 2, Qt.PenStyle.DashLine))
             p.drawLine(QLineF(self.drop_x, self.RULER_H, self.drop_x, H))
+        g = self.ghost
+        if g:                                                         # [52.36] a clip being dragged between rows
+            col = QColor("#ffb020" if g.get("ok", True) else "#e05050")
+            tr = g.get("target")
+            if tr is not None:
+                p.setPen(QPen(col, 2, Qt.PenStyle.DashLine))
+                p.setBrush(QColor(col.red(), col.green(), col.blue(), 40))
+                p.drawRoundedRect(tr, 3, 3)
+                if g.get("new"):
+                    p.setPen(col)
+                    p.drawText(QPointF(max(hw, 0) + 8, tr.center().y() - 4), "+ new track")
+            r = g["rect"]
+            p.setOpacity(0.85)
+            p.setPen(QPen(QColor("#ffffff"), 1.5))
+            p.setBrush(QColor(g.get("color", "#7b62b0")))
+            p.drawRoundedRect(r, 3, 3)
+            if r.width() > 30:
+                p.setPen(QColor("#101010"))
+                p.drawText(QPointF(r.x() + 5, r.center().y() + 4), p.fontMetrics().elidedText(g.get("label", ""), Qt.TextElideMode.ElideRight, int(r.width() - 10)))
+            p.setOpacity(1.0)
         x = self.tx(self.playhead)
         p.setPen(QPen(QColor("#2d8ceb"), 1.5))
         p.drawLine(QLineF(x, self.RULER_H, x, H))
@@ -1478,7 +1567,7 @@ class Timeline(QWidget):
             p.setPen(QPen(QColor("#ffffff"), 2))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRoundedRect(run, 3, 3)
-        if lifted:
+        if lifted and self.ghost is None:
             # Draw the dragged block anchored continuously to the mouse (via _grab/_mx) rather than to
             # its current model position, which can jump the instant a drag reorders the underlying
             # segs list. cum walks the block's own clips in their fixed relative order/spacing.

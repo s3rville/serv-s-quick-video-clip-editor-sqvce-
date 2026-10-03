@@ -164,10 +164,10 @@ class Recovery(QObject):
         if self._closed or not self._armed:
             return
         try:
-            if not self.win.seq.segs:
+            payload = self._build()
+            if not payload["clips"] and not self._ext_has_items(payload["ext"]):
                 self.discard()                 # nothing worth recovering
                 return
-            payload = self._build()
         except Exception:
             return                              # autosave must never take the editor down
         with self._cv:
@@ -178,6 +178,14 @@ class Recovery(QObject):
 
     # GUI thread. Plain dict/list/str/number/tuple values only, all copied here, so the writer thread never touches
     # live objects (Seg / Media / Sequence). Field order comes from Sequence.snapshot() == Seg.__init__ order.
+    @staticmethod
+    def _ext_has_items(ext):
+        return any(isinstance(d, dict) and d.get("items") for d in ext.values())
+
+    def _host(self):
+        """[52.31] The PluginHost (found by type: its attribute name lives in main_window.py)."""
+        return next((v for v in vars(self.win).values() if isinstance(v, PluginHost)), None)
+
     def _build(self):
         w, seq = self.win, self.win.seq
         keys = {m: k for k, m in w.by_path.items()}      # Media -> project key (Media is hashed by identity)
@@ -187,7 +195,19 @@ class Recovery(QObject):
                   "atracks": [bool(a) for a in atracks], "vol_db": vol_db, "track_type": track_type}
                  for (m, in_s, out_s, xf, mute, speed, mirror, rot, rev, grp, atracks, vol_db, track_type)
                  in seq.snapshot()]
+        ext = {}                                         # [52.31] mods / lanes (audio strip, Advanced overlay video tracks)
+        for name, p in seq.ext.items():
+            f = getattr(p, "recovery_export", None)
+            try:
+                d = f(key_of) if f else None
+            except Exception:
+                d = None
+            if d:
+                ext[name] = d
+        host = self._host()
+        shown = getattr(host, "shown", None) if host else None
         return {"format": RECOVERY_FORMAT, "version": RECOVERY_VERSION, "saved_at": time.time(),
+                "ext": ext, "mod_mode": getattr(shown, "file", None),
                 "medias": [key_of(m) for m in w.medias],
                 "primary": key_of(w.primary) if w.primary is not None else None,
                 "clips": clips,
@@ -317,10 +337,11 @@ class Recovery(QObject):
                 data = json.load(f)
             ok = (isinstance(data, dict) and data.get("format") == RECOVERY_FORMAT
                   and type(data.get("version")) is int and data["version"] == RECOVERY_VERSION
-                  and isinstance(data.get("clips"), list) and isinstance(data.get("medias"), list))
+                  and isinstance(data.get("clips"), list) and isinstance(data.get("medias"), list)
+                  and isinstance(data.get("ext", {}), dict))
         except Exception:
             ok = False
-        if not ok or not data["clips"]:
+        if not ok or not (data["clips"] or any(isinstance(d, dict) and d.get("items") for d in data.get("ext", {}).values())):
             self.discard()
             if not ok:
                 self.win.statusBar().showMessage("Ignored an unreadable recovery file.", 6000)
@@ -350,8 +371,10 @@ class Recovery(QObject):
                 clips.append(_parse_clip(c))
             except Exception:
                 bad += 1
+        ext_data = data.get("ext") if isinstance(data.get("ext"), dict) else {}
+        ext_keys = [k for d in ext_data.values() if isinstance(d, dict) for k in (d.get("media_keys") or []) if isinstance(k, str)]
         keys = []
-        for k in [m for m in data["medias"] if isinstance(m, str)] + [c["media"] for c in clips]:
+        for k in [m for m in data["medias"] if isinstance(m, str)] + [c["media"] for c in clips] + ext_keys:
             ap = os.path.abspath(k)
             if ap not in keys:
                 keys.append(ap)
@@ -360,6 +383,14 @@ class Recovery(QObject):
         if present:
             w.import_paths(present)
         by = w.by_path
+        host, mode = self._host(), data.get("mod_mode")            # [52.31] back into the mod mode (Advanced) the crash happened in
+        if host is not None and isinstance(mode, str):
+            info = host.loaded.get(mode)
+            if info is not None and getattr(info, "btn", None) is not None and host.shown is not info:
+                try:
+                    info.btn.click()                              # same path as the user clicking the tab: creates the mod's lanes
+                except Exception:
+                    pass
         segs, skipped = [], {}
         for c in clips:
             k = c["media"]
@@ -414,13 +445,36 @@ class Recovery(QObject):
                 t = 0.0
             w.engine.seek(max(0.0, min(t, seq.total())), play=False)
             self._timer.start(RECOVERY_DEBOUNCE_MS)    # refresh the file so it matches what is really on the timeline now
-        if skipped or bad or not segs:
+        ext_n, ext_lost = 0, []
+        for name, d in ext_data.items():                           # [52.31] audio strip / overlay tracks (providers may be missing)
+            p = seq.ext.get(name)
+            f = getattr(p, "recovery_import", None)
+            try:
+                n = f(d, by) if (f and isinstance(d, dict)) else 0
+            except Exception:
+                n = 0
+            ext_n += n
+            if not n and isinstance(d, dict) and d.get("items"):
+                ext_lost.append(name)
+        if ext_n:
+            if not segs:
+                seq.undo_stack.clear()
+                seq.redo_stack.clear()
+                seq._invalidate_geometry()
+                seq.edited.emit()
+            else:
+                seq.undo_stack.clear()
+                seq.redo_stack.clear()
+            self._timer.start(RECOVERY_DEBOUNCE_MS)
+        if skipped or bad or ext_lost or not (segs or ext_n):
             lines = [f"  {os.path.normpath(k)} - {n} clip{'s' if n != 1 else ''} ({why})" for k, (n, why) in skipped.items()]
             if bad:
                 lines.append(f"  {bad} damaged clip entr{'y' if bad == 1 else 'ies'} in the recovery file")
-            head = (f"Restored {len(segs)} clip{'s' if len(segs) != 1 else ''}. These were skipped:" if segs
+            for name in ext_lost:
+                lines.append(f"  saved '{name}' clips (files missing / mod not available)")
+            head = (f"Restored {len(segs) + ext_n} clip{'s' if len(segs) + ext_n != 1 else ''}. These were skipped:" if (segs or ext_n)
                     else "Nothing could be restored:")
             more = f"\n  ...and {len(lines) - 15} more" if len(lines) > 15 else ""
             QMessageBox.information(w, "Session restore", head + "\n\n" + "\n".join(lines[:15]) + more)
         else:
-            w.statusBar().showMessage(f"Restored your last session ({len(segs)} clips).", 6000)
+            w.statusBar().showMessage(f"Restored your last session ({len(segs) + ext_n} clips).", 6000)

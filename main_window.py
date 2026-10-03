@@ -22,6 +22,15 @@ import tempfile
 import threading
 import subprocess
 
+# [52.34] PyInstaller only bundles modules the program imports statically; mods are loaded from disk at runtime, so a stdlib
+# module that ONLY a mod imports is missing in the .exe ("Mod 'x.py' failed to load"). Listed here so frozen builds include
+# them: uuid / urllib / ssl / http (gif_tab, text_tool, fx_tab, bookmarks) plus common extras for future mods. A mod that needs
+# anything else (stdlib or pip) must have it added here or in the .spec hiddenimports.
+import uuid, atexit, base64, csv, zipfile, secrets, hmac, html, datetime, itertools, collections
+import ssl, http.client
+import urllib.request, urllib.parse, urllib.error
+import concurrent.futures
+
 # [STALE][KNOWN ISSUE F14] Unused imports (safe to delete): QRect, QRegion, QCursor (QtCore/QtGui) and
 # QVideoWidget (QtMultimediaWidgets - replaced by VideoView/QGraphicsVideoItem). Left as-is on purpose.
 from PySide6.QtCore import (Qt, QUrl, QTimer, QObject, Signal, QRectF, QPointF, QLineF,
@@ -460,9 +469,17 @@ class MainWindow(QMainWindow):
 
     # [52.2] "tab" mods: a window like Project/Preview/Timeline. Sits right of Preview in the top row, has a Panel header,
     # follows the lock/unlock + eye-menu rules. Its position is NOT persisted (re-placed at every start / layout reset).
+    # [52.33] Left (Project) and right (Preview + first mod window) are occupied -> every further mod window is TABBED onto
+    # the first one instead of splitting the row thinner. Still unlockable/movable: drag a tab or its title bar anywhere.
     def _place_mod_dock(self, d):
         h, pv = self.dock_host, self.docks["preview"]
+        others = [x for x in self.mod_docks.values() if x is not d and not x.isHidden() and not x.isFloating()]
         h.removeDockWidget(d)
+        if others:
+            h.tabifyDockWidget(others[0], d)
+            d.show()
+            d.raise_()
+            return
         h.splitDockWidget(pv, d, Qt.Orientation.Horizontal)
         w = max(240, d._panel.sizeHint().width())
         QTimer.singleShot(0, lambda: h.resizeDocks([pv, d], [max(200, pv.width() - w), w], Qt.Orientation.Horizontal)
@@ -655,11 +672,23 @@ class MainWindow(QMainWindow):
         self.est_label.setStyleSheet("color:#8f8f8f;")
         self.est_label.setToolTip("Rough estimate of the exported file size")
         l.insertWidget(est_idx, self.est_label)
+        # [52.33] Advanced mode only: ONE button whose TEXT is the export kind ("Video" / "GIF"), like Precise/Keyframes.
+        # Video = lossless or the Transcode checkbox + preset + cog; GIF = GIF preset + cog. Hidden outside Advanced.
+        self.kind_btn = QPushButton(self.adv_kind_pref())
+        self.kind_btn.setObjectName("kindbtn")
+        self.kind_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.kind_btn.setToolTip("Advanced mode: choose what Export makes.\n"
+                                 "Video: lossless copy, or re-encode with the Transcode checkbox and its presets.\n"
+                                 "GIF: shows the GIF presets; Export writes a .gif.")
+        self.kind_btn.clicked.connect(lambda: self.set_export_kind("Video" if self.kind_btn.text() == "GIF" else "GIF"))
+        self.kind_btn.hide()
+        l.addWidget(self.kind_btn)
         self.export_btn = QPushButton("Export")
         self.export_btn.setObjectName("primary")
         self.export_btn.setToolTip("Export sequence as a new file (Ctrl+M)")
         self.export_btn.clicked.connect(self.export)
         l.addWidget(self.export_btn)
+        self._sync_export_bar()                   # [52.33] initial visibility of GIF / Transcode / Save-Over controls
         return bar
 
     def build_project(self):
@@ -1513,7 +1542,7 @@ class MainWindow(QMainWindow):
         segs = self.seq.segs
         if not segs:
             return 0
-        if self.app_mode == "GIF":
+        if self.is_gif():
             p = self.gif_combo.currentData()
             if not p:
                 return 0
@@ -1576,8 +1605,8 @@ class MainWindow(QMainWindow):
     def est_secs(self):
         """Very rough encode-time estimate (copy cuts are fast, re-encodes scale with pixels x frames)."""
         segs = self.seq.segs
-        gif = self.app_mode == "GIF"
-        transcode = self.app_mode == "Video" and self.hb_check.isChecked()
+        gif = self.is_gif()
+        transcode = not gif and self.hb_check.isChecked()
         t = 1.0
         for sg in segs:
             m = sg.media
@@ -1795,6 +1824,46 @@ class MainWindow(QMainWindow):
             self.set_tool("resize")
 
     app_mode = "Video"
+    adv_kind = None          # [52.33] None = normal Video/GIF modes decide; "Video"/"GIF" = Advanced's export toggle decides
+
+    # [MAP 52.33] ONE rule for "is this a GIF export?": Advanced's toggle wins while it is shown, else the Video/GIF tab.
+    # est_bytes / est_secs / export / _sync_export_bar all use it - never test app_mode == "GIF" directly.
+    def is_gif(self):
+        return (self.adv_kind or self.app_mode) == "GIF"
+
+    def adv_kind_pref(self):
+        k = QSettings("QuickCut", "QuickCut").value("adv_kind", "Video", str)
+        return k if k in ("Video", "GIF") else "Video"
+
+    # [MAP 52.33] The ONLY place that decides which preset controls are visible: GIF combo+cog (GIF), Transcode checkbox +
+    # its combo+cog (not GIF), Save-Over button (not GIF). Called by request_mode, _on_hb_toggled, set_export_kind and
+    # set_export_kind_toggle (Advanced mod via ModAPI.set_export_toggle).
+    def _sync_export_bar(self):
+        gif = self.is_gif()
+        self.gif_combo.setVisible(gif)
+        self.gif_cog.setVisible(gif)
+        self.saveover_btn.setVisible(not gif)
+        self.hb_check.setVisible(not gif)
+        show = self.hb_check.isChecked() and not gif
+        self.hb_combo.setVisible(show)
+        self.hb_cog.setVisible(show)
+
+    def set_export_kind(self, kind):
+        if kind not in ("Video", "GIF"):
+            return
+        self.kind_btn.setText(kind)
+        QSettings("QuickCut", "QuickCut").setValue("adv_kind", kind)
+        if self.adv_kind is not None:
+            self.adv_kind = kind
+            self._sync_export_bar()
+            self.update_est()
+
+    def set_export_kind_toggle(self, on):
+        """Advanced mod: show/hide the Video|GIF toggle next to Export. Off -> the Video/GIF tab rules again."""
+        self.adv_kind = self.kind_btn.text() if on else None
+        self.kind_btn.setVisible(bool(on))
+        self._sync_export_bar()
+        self.update_est()
 
     # [MAP] Preset persistence helpers (gif_customs / reload_gif_combo / edit_gif_presets and the hb_* twins).
     # Bad or partial JSON in settings is ignored (returns []), and reload_* selects the previous title if it still
@@ -1847,9 +1916,8 @@ class MainWindow(QMainWindow):
 
     def _on_hb_toggled(self, on):
         self._hb_settings.setValue("hb_on", bool(on))
-        show = on and self.app_mode != "GIF"
-        self.hb_combo.setVisible(show)
-        self.hb_cog.setVisible(show)
+        if hasattr(self, "kind_btn"):
+            self._sync_export_bar()
         if hasattr(self, "est_label"):
             self.update_est()
 
@@ -1899,10 +1967,7 @@ class MainWindow(QMainWindow):
         SB = QMessageBox.StandardButton
         self.app_mode = name
         self.titlebar.set_mode(name)
-        self.gif_combo.setVisible(name == "GIF")
-        self.gif_cog.setVisible(name == "GIF")
-        self.saveover_btn.setVisible(name != "GIF")
-        self.hb_check.setVisible(name != "GIF")
+        self._sync_export_bar()                  # [52.33] gif/transcode/save-over visibility in one place
         self._on_hb_toggled(self.hb_check.isChecked())
         self.update_est()
         if name == "GIF" and not keep:
@@ -2304,6 +2369,24 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Pasted clip", 3000)
 
     # ------------------------------------------------------------------ export / save-over
+    # [52.34] Plays finish.mp3 when an export / GIF export / Save-Over succeeds. Looked up next to the .exe (frozen) or this
+    # file, then the PyInstaller bundle dir; silently does nothing when the file is missing or audio fails.
+    def play_finish_sound(self):
+        try:
+            dirs = []
+            if getattr(sys, "frozen", False):
+                dirs.append(os.path.dirname(sys.executable))
+                if getattr(sys, "_MEIPASS", None): dirs.append(sys._MEIPASS)
+            dirs.append(os.path.dirname(os.path.abspath(__file__)))
+            f = next((os.path.join(d, "finish.mp3") for d in dirs if os.path.isfile(os.path.join(d, "finish.mp3"))), None)
+            if not f: return
+            if not hasattr(self, "_fin_player"):
+                self._fin_player = QMediaPlayer(self); self._fin_out = QAudioOutput(self)
+                self._fin_player.setAudioOutput(self._fin_out)
+            self._fin_player.setSource(QUrl.fromLocalFile(f)); self._fin_player.play()
+        except Exception:
+            pass
+
     # [MAP] Shared launcher for Export, GIF export and Save-Over. Builds a WindowModal QProgressDialog sized
     # (1 part -> 1 step, n parts -> n+1) + 1 for GIF/Transcode, starts an ExportWorker (precise is FORCED on for GIF),
     # disables the Export/Save-Over BUTTONS while running and re-enables them in `finished`. The worker and dialog are
@@ -2334,6 +2417,7 @@ class MainWindow(QMainWindow):
             dlg.close()
             self.export_btn.setEnabled(True)
             self.saveover_btn.setEnabled(True)
+            if ok: self.play_finish_sound()
             on_done(ok, msg)
 
         w.done.connect(finished)
@@ -2374,7 +2458,7 @@ class MainWindow(QMainWindow):
         parts = self._checked_parts()
         if parts is None:
             return
-        if self.app_mode == "GIF":
+        if self.is_gif():
             return self.export_gif(parts)
         self.engine.pause()
         first = parts[0][0]

@@ -20,7 +20,7 @@ import itertools
 
 from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QObject, QUrl, QSizeF, QEvent
 from PySide6.QtGui import QColor, QPen
-from PySide6.QtWidgets import QMenu, QWidget, QVBoxLayout, QLabel, QPushButton, QScrollArea, QFrame, QDialog
+from PySide6.QtWidgets import QMenu, QWidget, QVBoxLayout, QLabel, QPushButton, QScrollArea, QFrame, QDialog, QGraphicsRectItem, QGraphicsItem, QGraphicsView, QGraphicsScene, QMessageBox, QCheckBox
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 
@@ -48,8 +48,26 @@ class LinkedAudio:
     def _has_audio(s):
         return bool(s.media is not None and s.media.acodec.strip() and not getattr(s.media, "blank", False))
 
+    # [52.35] Overlay clips (Video 2, 3 ...) get their own linked-audio row too, one row per overlay track that has audible clips,
+    # listed under the base clip's stream rows. Selecting one selects the overlay clip; right-click > Unlink audio moves it to the audio strip.
+    def _base_n(self, tl):
+        return max([max(1, len(s.media.audio_streams)) for s in tl.seq.segs if self._has_audio(s) and not s.mute] or [0])
+
+    def _ov_clips(self, tl):
+        vt = getattr(tl, "vtrack", None)
+        if vt is None or not vt.enabled:
+            return []
+        return [c for c in vt.items if not c.mute and c.media.acodec.strip() and not getattr(c.media, "blank", False)]
+
+    def _ov_rects(self, tl, y):
+        """[(VClip, QRectF)] - one row per overlay track (highest track first), below the base stream rows."""
+        cl = self._ov_clips(tl)
+        trk = sorted({c.track for c in cl}, reverse=True)
+        b = self._base_n(tl)
+        return [(c, QRectF(tl.tx(c.t0), y + 1 + (b + trk.index(c.track)) * ROW_H, max(2.0, c.dur * tl.pps), ROW_H - 2)) for c in cl]
+
     def height(self, tl):
-        n = max([max(1, len(s.media.audio_streams)) for s in tl.seq.segs if self._has_audio(s) and not s.mute] or [0])
+        n = self._base_n(tl) + len({c.track for c in self._ov_clips(tl)})
         return n * ROW_H + 3 if n else 0
 
     def _rects(self, tl, y):
@@ -86,11 +104,71 @@ class LinkedAudio:
                     p.setPen(QPen(QColor("#ffffff"), 1.5))
                     p.setBrush(Qt.BrushStyle.NoBrush)
                     p.drawRoundedRect(r, 3, 3)
+        vt = getattr(tl, "vtrack", None)
+        for c, r in self._ov_rects(tl, y):                      # [52.35] overlay clips' audio
+            if r.right() < tl.HW or r.left() > W:
+                continue
+            p.setPen(QPen(QColor("#101010"), 1))
+            p.setBrush(QColor("#4f7fa0"))
+            p.drawRoundedRect(r, 3, 3)
+            if r.width() > 40:
+                p.setPen(QColor("#0e1a22"))
+                p.drawText(QPointF(r.x() + 5, r.y() + ROW_H - 4), fm.elidedText(c.media.name, Qt.TextElideMode.ElideRight, int(r.width() - 10)))
+            if vt is not None and (c is vt.sel or c in vt.selset):
+                p.setPen(QPen(QColor("#ffffff"), 1.5))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRoundedRect(r, 3, 3)
+
+    def _press_ov(self, e, tl, c):
+        vt, pos = tl.vtrack, e.position()
+        tl._keep_vsel = True                                   # we set the selection ourselves (Timeline would clear the strips')
+        tl.sel, tl.multi_sel = -1, set()
+        for ln in tl.lanes:
+            if ln is not self:
+                getattr(ln, "clear_sel", lambda t: None)(tl)
+        if tl.atrack:
+            tl.atrack.clear_sel(tl)
+        vt.sel, vt.selset = c, {c}
+        vt.sync()
+        if e.button() == Qt.MouseButton.RightButton:
+            m = QMenu(tl)
+            a = m.addAction("Unlink audio (to audio track)")
+            if m.exec(tl.mapToGlobal(pos.toPoint())) is a:
+                self.unlink_ov([c])
+        return True
+
+    def unlink_ov(self, clips):
+        api = self.api
+        seq, at, vt = api.seq, api.win.atrack, api.tl.vtrack
+        if seq.locked & {"video_overlay", "audio"}:
+            api.status("Can't unlink: the overlay Video or Audio row is locked (click its padlock).")
+            return
+        if at is None or vt is None:
+            return
+
+        def do():
+            for c in clips:
+                c.mute = True
+                k = at.free_track(c.t0, c.dur)
+                if k is None:
+                    at.ntracks += 1
+                    k = at.ntracks - 1
+                at.items.append(AClip(c.media, c.t0, c.in_s, c.out_s, False, c.vol_db, track=k))
+            at.sel = at.items[-1]
+            at.changed()
+            vt.changed()
+            return True
+        api.engine.pause()
+        seq.edit(do)
+        api.status("Audio unlinked - it is now a clip on the audio track.")
 
     def press(self, e, tl):
         if tl.tool != "select":
             return False
         pos = e.position()
+        oc = next((c for c, r in self._ov_rects(tl, self._y0(tl)) if r.contains(pos)), None)
+        if oc is not None:
+            return self._press_ov(e, tl, oc)
         k = next((k for k, rs in self._rects(tl, self._y0(tl)) if any(r.contains(pos) for r in rs)), None)
         if k is None:
             return False
@@ -185,20 +263,53 @@ class PropertiesPanel(QWidget):
     def vals(s):
         return (s.mute, round(s.speed, 2), s.mirror, s.rev, tuple(s.atracks), round(s.vol_db, 2), s.track_type)
 
+    # [52.37] A selected TEXT clip (text_tool mod, registered in seq.ext["text_tool"]) shows the text options here too.
+    def text_item(self):
+        st = self.api.seq.ext.get("text_tool")
+        sel = getattr(st, "selset", None)
+        if st is None or not sel or len(sel) != 1 or not hasattr(st, "panel"):
+            return None, None
+        return st, next(iter(sel))
+
+    @staticmethod
+    def tsig(it):
+        return ("T", it.id, it.text, it.t0, it.dur, round(it.x, 3), round(it.y, 3), round(it.w, 3), round(it.h, 3))
+
     def poll(self):
         if self.apply_t.isActive():                       # the user is mid-edit: don't rebuild under them
             return
+        if getattr(self.dlg, "flush", None) is not None and self.dlg._t.isActive():
+            return                                        # text panel mid-edit
         s = self.current()
-        sig = None if s is None else (id(s), self.vals(s))
+        st, it = (None, None) if s is not None else self.text_item()
+        sig = (id(s), self.vals(s)) if s is not None else (self.tsig(it) if it is not None else None)
         if sig != self.sig:
             self.sig = sig
-            self.build(s)
+            if it is not None:
+                self.build_text(st, it)
+            else:
+                self.build(s)
 
-    def build(self, s):
+    def build_text(self, st, it):
+        self.teardown()
+        self.seg = None
+        d = st.panel(it, on_apply=lambda: setattr(self, "sig", self.tsig(it)))     # our own change: no rebuild
+        self.dlg = d
+        self.msg.hide()
+        self.sa.setWidget(d)
+        self.sa.show()
+        d.show()
+
+    def teardown(self):
         if self.dlg is not None:
+            if getattr(self.dlg, "flush", None) is not None:
+                self.dlg.flush()                            # pending text edit -> its undo step
             self.sa.takeWidget()
             self.dlg.deleteLater()
             self.dlg = None
+
+    def build(self, s):
+        self.teardown()
         self.seg = s
         if s is None or getattr(s.media, "blank", False):
             self.sa.hide()
@@ -246,73 +357,124 @@ class PropertiesPanel(QWidget):
         self.api.status("Clip options applied - clips with speed / mute / mirror / reverse are re-encoded on export.", 4000)
 
 
-# ----------------------------------------------------------------------------- part 3: overlay video tracks (merged from video_track.py [52.28])
-# "Video 2", "Video 3", ... : VClip(media, t0, in_s, out_s, mute, vol_db, grp, track) with absolute times (no ripple), never overlapping
-# WITHIN a track, higher track drawn on top. 1x forward only, no crop/speed/mirror. History: seq.ext["video_overlay"].
-# Timeline: VideoTrack is a LANE at tl.lanes[1]; the "+" sits on the BASE Video row (Timeline.vtrack / header_plus=False here).
-# Clips get there by dropping files on an overlay row (drop_files), right-click base clip > "Send to overlay Video track",
-# and back via right-click overlay clip > "Move to main video row"; dragging vertically moves between overlay tracks.
-# Preview: per track a QMediaPlayer + QGraphicsVideoItem inside VideoView's scene (above the base item, below the freeze overlay),
-# fitted to the view. Export: EXPORT_HOOKS[0] composites with ffmpeg overlay (scaled to the base size, centred) and mixes overlay audio;
-# active only while the Advanced tab is on. [KNOWN] no stills / audio-only files, not in recovery.json, drop probing blocks the GUI briefly.
+# ----------------------------------------------------------------------------- part 3: overlay video tracks
+# "Video 2", "Video 3", ... : VClip(media, t0, in_s, out_s, mute, vol_db, grp, track, rect, crop) with absolute times (no ripple), never
+# overlapping WITHIN a track; a higher track is drawn on top. 1x forward only (no speed/mirror). History: seq.ext["video_overlay"].
+# [52.29] Layout: the overlay tracks are a STRIP ABOVE the base Video row (Timeline.vtrack / strip_y / strips(); highest track on top).
+#   The "+" is on the BASE Video row header. Dragging a clip vertically moves it between overlay tracks.
+# [52.29/52.30] Every overlay clip has its OWN placement: `rect` = (x, y, w, h) of the UNCROPPED picture and `crop` = (l, t, r, b)
+#   fractions of the picture, all normalised to the OUTPUT FRAME (None rect = "fit and centre"). It is edited with the program's OWN
+#   Crop / Resize tools (VideoStage.edit_xf, one set of handles): select an overlay clip, pick the tool, park the playhead inside it.
+#   Overlays are drawn on _OvlView, a layer sized to the output frame, so the base clip's crop/resize never clips them and they can sit
+#   on blank canvas. Same maths in preview (_Layer) and export (_Export).
+# Clips get on a track by dropping files on an overlay row, right-click base clip > "Send to overlay Video track", and back via
+# right-click overlay clip > "Move to main video row". Preview: per track a QMediaPlayer + QGraphicsVideoItem (inside a clipping
+# container item) in VideoView's scene, above the base item and below the freeze overlay. Export: EXPORT_HOOKS[0] composites with
+# ffmpeg overlay and mixes overlay audio; active only while the Advanced tab is on.
+# [KNOWN] no stills / audio-only files, no rotation, not in recovery.json, drop probing blocks the GUI briefly. While the base clip is
+#   cropped/resized the overlay canvas is the visible preview area (approximate).
 MIN_V = 0.3
 _vids = itertools.count(1)
+MIN_FRAC = 0.05                                                # smallest visible fraction left by cropping
+
+
+def _num(v, lo=-1e12, hi=1e12):
+    """[52.31] Validated finite number from the (untrusted) recovery file, or ValueError."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or not lo <= float(v) <= hi:
+        raise ValueError("bad number")
+    return float(v)
 
 
 class VClip:
-    def __init__(self, media, t0, in_s, out_s, mute=False, vol_db=0.0, grp=None, track=0):
+    def __init__(self, media, t0, in_s, out_s, mute=False, vol_db=0.0, grp=None, track=0, rect=None, crop=(0.0, 0.0, 0.0, 0.0)):
         self.id = next(_vids)
         self.media, self.t0, self.in_s, self.out_s, self.mute, self.vol_db = media, t0, in_s, out_s, mute, vol_db
         self.grp, self.track = grp, track
+        self.rect = tuple(rect) if rect else None
+        self.crop = tuple(crop)
 
     dur = property(lambda s: s.out_s - s.in_s)
     end = property(lambda s: s.t0 + s.out_s - s.in_s)
 
     def tup(self):
-        return (self.id, self.media, self.t0, self.in_s, self.out_s, self.mute, self.vol_db, self.grp, self.track)
+        return (self.id, self.media, self.t0, self.in_s, self.out_s, self.mute, self.vol_db, self.grp, self.track, self.rect, self.crop)
+
+
+def eff_rect(c, car):
+    """(x, y, w, h) of the uncropped picture, normalised to the canvas; car = canvas aspect (w/h). Default = fit + centre."""
+    if c.rect:
+        return c.rect
+    m = c.media
+    ar = (m.w / m.h) if getattr(m, "w", 0) and getattr(m, "h", 0) else car
+    if ar >= car:
+        h = car / ar
+        return (0.0, (1.0 - h) / 2.0, 1.0, h)
+    w = ar / car
+    return ((1.0 - w) / 2.0, 0.0, w, 1.0)
+
+
+def shown_rect(c, car):
+    """The visible (cropped) region (x, y, w, h), normalised."""
+    x, y, w, h = eff_rect(c, car)
+    cl, ct, cr, cb = c.crop
+    return (x + cl * w, y + ct * h, w * (1 - cl - cr), h * (1 - ct - cb))
 
 
 class _Layer(QObject):
-    """Preview of ONE overlay track: own player + video item + audio output."""
+    """Preview of ONE overlay track: own player + audio output; the video item sits in a clipping container (= the crop)."""
     def __init__(self, vt, k):
         super().__init__(vt)
         self.vt, self.k = vt, k
         self.pl, self.ao = QMediaPlayer(self), QAudioOutput(self)
         self.pl.setAudioOutput(self.ao)
-        self.item = QGraphicsVideoItem()
-        self.item.setZValue(1 + k)
-        self.item.setVisible(False)
-        vt.view._scene.addItem(self.item)
+        self.box = QGraphicsRectItem()
+        self.box.setPen(QPen(Qt.PenStyle.NoPen))
+        self.box.setFlag(QGraphicsItem.GraphicsItemFlag.ItemClipsChildrenToShape, True)
+        self.box.setZValue(1 + k * 0.1)
+        self.box.setVisible(False)
+        self.item = QGraphicsVideoItem(self.box)
+        self.item.setAspectRatioMode(Qt.AspectRatioMode.IgnoreAspectRatio)
+        vt.view._scene.addItem(self.box)
         self.pl.setVideoOutput(self.item)
-        self._src, self._go, self._pos, self._want_play = None, False, 0, False
+        self._src, self._go, self._pos, self._c = None, False, 0, None
         self.pl.mediaStatusChanged.connect(self._status)
 
-    def layout(self):
+    def layout(self, c=None):
+        c = c or self._c
+        if c is None:
+            return
         v = self.vt.view
-        self.item.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
-        self.item.setPos(0, 0)
-        self.item.setSize(QSizeF(max(1, v.width()), max(1, v.height())))
+        vw, vh = max(1, v.width()), max(1, v.height())
+        x, y, w, h = eff_rect(c, vw / float(vh))
+        cl, ct, cr, cb = c.crop
+        fw, fh = w * vw, h * vh
+        self.box.setRect(0, 0, max(1.0, fw * (1 - cl - cr)), max(1.0, fh * (1 - ct - cb)))
+        self.box.setPos(x * vw + cl * fw, y * vh + ct * fh)
+        self.item.setPos(-cl * fw, -ct * fh)
+        self.item.setSize(QSizeF(max(1.0, fw), max(1.0, fh)))
 
     def dispose(self):
         self.pl.stop()
-        self.vt.view._scene.removeItem(self.item)
+        self.pl.setVideoOutput(None)                          # [52.31] never leave a player pointing at an item that is about to die
+        self.pl.setSource(QUrl())
+        self.vt.view._scene.removeItem(self.box)
 
     def reset(self):
         self.pl.stop()
-        self._src = None
-        self.item.setVisible(False)
+        self._src, self._c = None, None
+        self.box.setVisible(False)
 
     def follow(self, c, t, playing):
+        self._c = c
         if c is None:
-            self.item.setVisible(False)
+            self.box.setVisible(False)
             if self.pl.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
                 self.pl.pause()
             return
-        self.layout()
-        self.item.setVisible(True)
+        self.layout(c)
+        self.box.setVisible(True)
         pos = int((c.in_s + t - c.t0) * 1000)
         self.ao.setVolume(0.0 if c.mute else max(0.0, min(1.0, 10 ** (c.vol_db / 20.0))))
-        self._want_play = playing
         path = c.media.path
         if self._src != path:
             self._src, self._go, self._pos = path, True, pos
@@ -336,22 +498,50 @@ class _Layer(QObject):
             self.vt.sync()
 
 
+class _OvlView(QGraphicsView):
+    """[52.30] Transparent full-CANVAS layer for the overlay clips. Child of the stage, sized to the OUTPUT FRAME rect (not the base clip's
+    crop mask), so overlays can sit on blank canvas area and are never clipped by the base clip's crop/resize."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setBackgroundBrush(Qt.BrushStyle.NoBrush)
+        self.setStyleSheet("background: transparent; border: 0;")
+        self.viewport().setAutoFillBackground(False)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setInteractive(False)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.hide()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._scene.setSceneRect(0, 0, max(1, self.width()), max(1, self.height()))
+
+
 class VideoTrack(QObject):
     H = 30
     name = "Video"
     lock_key = "video_overlay"
-    header_plus = False                                       # the "+" is on the base Video row (Timeline.rows_ex)
+    header_plus = False                                       # overlay rows have no "+" of their own: it is on the base Video row
 
     def __init__(self, win):
         super().__init__(win)
         self.win, self.tl, self.seq, self.eng = win, win.tl, win.seq, win.engine
-        self.view = win.stage.video
+        self.stage = win.stage
+        self.view = _OvlView(win.stage)                       # [52.30] full-canvas layer (see _OvlView)
         self.items, self.sel, self.selset, self.drag = [], None, set(), None
+        self.drop, self._drag_track = None, 0                 # [52.35] drop target of a move: ("new"|"base", time) or None
+        self._last_canvas, self._live_orig = None, None
         self.ntracks = 0                                      # overlay tracks (rows); 0 = none until "+" / first send / drop
         self.enabled = False
         self.layers = []
         self.seq.ext["video_overlay"] = self
         self.view.installEventFilter(self)
+        self._install_stage_hooks()
         self.eng.playStateChanged.connect(self.sync)
         self.eng.playheadChanged.connect(self._tick)
         self.seq.edited.connect(self.sync)
@@ -359,9 +549,164 @@ class VideoTrack(QObject):
         export_worker.EXPORT_HOOKS.insert(0, self.hook)
 
     # ------------------------------------------------------------------ lifecycle / history
+    # ------------------------------------------------------------------ [52.30] stage integration (ONE Crop/Resize UI for everything)
+    # The program's own Crop/Resize tools (VideoStage + CropOverlay) edit the SELECTED overlay clip through VideoStage.edit_xf; the stage
+    # still renders the base clip. Wrapped (instance attributes, undone in dispose): set_state (so a blank spot with no base clip still
+    # gets a canvas while editing), set_tool, relayout (keeps the overlay layer on the canvas rect).
+    def _install_stage_hooks(self):
+        st = self.stage
+        self._o_state, self._o_tool, self._o_lay = st.set_state, st.set_tool, st.relayout
+
+        def set_state(xf, src, fx=(0.0, False)):
+            if xf is None and self.edit_wanted():
+                cw, ch = self._last_canvas or (1920, 1080)
+                xf, src = (cw, ch, 0, 0, cw, ch), (cw, ch)
+            self._o_state(xf, src, fx)
+            if st._eff():
+                dw, dh = st._disp_dims()
+                if dw > 0 and dh > 0:
+                    self._last_canvas = (dw, dh)
+            self.refresh_edit()
+
+        def set_tool(tool):
+            self._o_tool(tool)
+            self.refresh_edit()
+
+        def relayout():
+            self._o_lay()
+            self.place()
+        st.set_state, st.set_tool, st.relayout = set_state, set_tool, relayout
+        st.ov_commit, st.ov_reset, st.ov_live = self.stage_commit, self.stage_reset, self.stage_live
+        st.cancelClicked.connect(self.restore_live)
+
+    def _remove_stage_hooks(self):
+        st = self.stage
+        for n in ("set_state", "set_tool", "relayout"):
+            try:
+                delattr(st, n)
+            except AttributeError:
+                pass
+        st.ov_commit = st.ov_reset = st.ov_live = None
+        st.edit_xf = None
+        try:
+            st.cancelClicked.disconnect(self.restore_live)
+        except Exception:
+            pass
+
+    def canvas_dims(self):
+        st = self.stage
+        if st._eff():
+            return st._disp_dims()
+        return self._last_canvas or (1920, 1080)
+
+    def place(self):
+        """Put the overlay layer exactly on the OUTPUT FRAME (canvas) rect of the stage."""
+        st = self.stage
+        if not (self.enabled and self.items):
+            self.view.hide()
+            return
+        S = st.rect()
+        if st._eff() is None or (st.xf is None and st.tool is None and not (st._rot() or st.fx[1])):
+            cw, ch = self.canvas_dims() if st._eff() else (self._last_canvas or (S.width(), S.height()))
+            k = min(S.width() / float(cw), S.height() / float(ch))     # untouched clip: the frame is the letterboxed fit area
+            w, h = cw * k, ch * k
+            rc = QRectF((S.width() - w) / 2.0, (S.height() - h) / 2.0, w, h)
+        else:
+            rc = QRectF(st._rc)
+        self.view.setGeometry(rc.toRect())
+        self.view.show()
+        self.view.stackUnder(st.overlay)
+        for ly in self.layers:
+            ly.layout()
+
+    def edit_wanted(self):
+        c = self.sel
+        return bool(self.enabled and c is not None and c in self.items and self.stage.tool in ("crop", "resize")
+                    and c.t0 - 1e-6 <= self.eng.playhead < c.end)
+
+    def to_xf(self, c, cw, ch):
+        x, y, w, h = eff_rect(c, cw / float(ch))
+        cl, ct, cr, cb = c.crop
+        return (cw, ch, x * cw, y * ch, w * cw, h * ch, "#000000",
+                (x + cl * w) * cw, (y + ct * h) * ch, w * (1 - cl - cr) * cw, h * (1 - ct - cb) * ch)
+
+    def refresh_edit(self):
+        st = self.stage
+        if self._live_orig is not None and self.edit_wanted():
+            return                                              # mid-drag: don't rebuild under the user
+        want = self.edit_wanted() and st._eff() is not None
+        new = self.to_xf(self.sel, *st._disp_dims()) if want else None
+        if not want:
+            self.restore_live()
+        if new != st.edit_xf:
+            st.edit_xf = new
+            st.pend = None
+            st.relayout()
+
+    def stage_live(self, u):                                    # resize drag: show the overlay at the dragged size
+        c = self.sel
+        if c is None:
+            return
+        cw, ch = self.canvas_dims()
+        if self._live_orig is None:
+            self._live_orig = (c.rect, c.crop)
+        c.rect = (u.x() / cw, u.y() / ch, max(0.02, u.width() / cw), max(0.02, u.height() / ch))
+        self.sync()
+
+    def restore_live(self, *_):
+        c, o = self.sel, self._live_orig
+        self._live_orig = None
+        if c is not None and o is not None:
+            c.rect, c.crop = o
+            self.sync()
+
+    def stage_commit(self, tool, u):
+        """OK in Crop/Resize while an overlay clip is the edit target. u = new picture rect (resize) / kept window (crop), canvas units."""
+        c = self.sel
+        if c is None:
+            return
+        o, self._live_orig = self._live_orig, None
+        if o is not None:
+            c.rect, c.crop = o                                   # undo the live preview, then apply once (single undo step)
+        if "video_overlay" in self.seq.locked:
+            self.seq.blocked.emit("video_overlay")
+            self.sync()
+            return
+        cw, ch = self.canvas_dims()
+        x, y, w, h = eff_rect(c, cw / float(ch))
+        before = self.begin()
+        if tool == "resize":
+            c.rect = (u.x() / cw, u.y() / ch, max(0.02, u.width() / cw), max(0.02, u.height() / ch))
+        else:
+            pic = QRectF(x * cw, y * ch, w * cw, h * ch)
+            clip = u.intersected(pic)
+            if clip.isEmpty() or clip.width() < MIN_FRAC * pic.width() or clip.height() < MIN_FRAC * pic.height():
+                self.sync()
+                return
+            c.rect = (x, y, w, h)
+            c.crop = (max(0.0, (clip.left() - pic.left()) / pic.width()), max(0.0, (clip.top() - pic.top()) / pic.height()),
+                      max(0.0, (pic.right() - clip.right()) / pic.width()), max(0.0, (pic.bottom() - clip.bottom()) / pic.height()))
+        self.changed()
+        self.record(before)
+        self.stage.edit_xf = None
+        self.refresh_edit()
+
+    def stage_reset(self):
+        c = self.sel
+        if c is None:
+            return
+        self.restore_live()
+        before = self.begin()
+        c.rect, c.crop = None, (0.0, 0.0, 0.0, 0.0)
+        self.changed()
+        self.record(before)
+        self.stage.edit_xf = None
+        self.refresh_edit()
+
     def set_enabled(self, on):
         self.enabled = bool(on)
         self.tl.vtrack = self if on else None
+        self.tl.refresh_lanes()
         self.sync()
 
     def dispose(self):
@@ -369,6 +714,10 @@ class VideoTrack(QObject):
         for ly in self.layers:
             ly.dispose()
         self.layers = []
+        self._remove_stage_hooks()
+        self.stage.relayout()
+        self.view.hide()
+        self.view.deleteLater()
         try:
             export_worker.EXPORT_HOOKS.remove(self.hook)
         except ValueError:
@@ -388,14 +737,51 @@ class VideoTrack(QObject):
     def ext_restore(self, data):
         self.ntracks, rows = data
         self.items = []
-        for i, m, t0, a, b, mu, vd, g, k in rows:
-            c = VClip(m, t0, a, b, mu, vd, g, k)
+        for i, m, t0, a, b, mu, vd, g, k, rc, cr in rows:
+            c = VClip(m, t0, a, b, mu, vd, g, k, rc, cr)
             c.id = i
             self.items.append(c)
         ids = {c.id for c in self.selset}
         self.sel = next((c for c in self.items if self.sel is not None and c.id == self.sel.id), None)
         self.selset = {c for c in self.items if c.id in ids}
         self.changed()
+
+    # ---- [52.31] crash recovery (see recovery.py). JSON-able dicts; media by project key.
+    def recovery_export(self, key_of):
+        if not self.items:
+            return None
+        return {"ntracks": self.ntracks, "media_keys": sorted({key_of(c.media) for c in self.items}),
+                "items": [{"media": key_of(c.media), "t0": c.t0, "in_s": c.in_s, "out_s": c.out_s, "mute": bool(c.mute),
+                           "vol_db": c.vol_db, "track": c.track, "rect": list(c.rect) if c.rect else None, "crop": list(c.crop)}
+                          for c in self.items]}
+
+    def recovery_import(self, data, by_path):
+        items = []
+        for d in data.get("items", []):
+            try:
+                m = by_path.get(os.path.abspath(d["media"]))
+                if m is None or not m.has_video:
+                    continue
+                a = max(0.0, _num(d["in_s"], 0.0))
+                b = min(_num(d["out_s"], 0.0), m.dur)
+                if b - a < MIN_V:
+                    continue
+                rc, cr = d.get("rect"), d.get("crop") or [0, 0, 0, 0]
+                rc = tuple(_num(v, -50, 50) for v in rc) if isinstance(rc, list) and len(rc) == 4 else None
+                cr = tuple(_num(v, 0, 1) for v in cr) if isinstance(cr, list) and len(cr) == 4 else (0.0, 0.0, 0.0, 0.0)
+                items.append(VClip(m, _num(d["t0"], 0.0), a, b, bool(d.get("mute")), _num(d.get("vol_db", 0.0), -400.0, 400.0), None,
+                                   int(_num(d.get("track", 0), 0, 99)), rc, cr))
+            except Exception:
+                continue
+        if not items:
+            return 0
+        self.items, self.sel, self.selset = items, None, set()
+        try:
+            self.ntracks = max(0, int(_num(data.get("ntracks", 0), 0, 99)))
+        except Exception:
+            self.ntracks = 0
+        self.changed()
+        return len(items)
 
     def begin(self):
         return self.seq.snapshot()
@@ -447,7 +833,9 @@ class VideoTrack(QObject):
         self.changed()
         self.record(before)
 
-    def remove_track(self, k):
+    def remove_track(self, row):
+        """`row` = display row (0 = top = highest track)."""
+        k = self.ntracks - 1 - row
         if any(c.track == k for c in self.items):
             self.status("Only an empty video track can be removed - move or delete its clips first.")
             return
@@ -460,8 +848,9 @@ class VideoTrack(QObject):
         self.record(before)
 
     # ------------------------------------------------------------------ moving between the base row and overlay tracks
-    def send_seg(self, idx):
-        """Base-row clip -> overlay track (same start time; the base row closes the gap, as with any ripple delete)."""
+    def send_seg(self, idx, track=None, t=None):
+        """Base-row clip -> overlay track (same start time; the base row closes the gap, as with any ripple delete).
+        [52.35] track = overlay track number, "new" = a new top track, None = first free; t = start time (default: its old start)."""
         seq = self.seq
         if not 0 <= idx < len(seq.segs):
             return
@@ -473,14 +862,24 @@ class VideoTrack(QObject):
                 or getattr(s.media, "blank", False) or not s.media.has_video):
             self.status("Only plain clips (1x, forward, no crop/resize/mirror/rotate) can go to an overlay track.")
             return
-        t0 = seq.starts()[idx]
+        t0 = seq.starts()[idx] if t is None else max(0.0, t)
 
         def do():
-            k = self.free_track(t0, s.src_dur)
-            if k is None:
+            at0 = t0
+            if track == "new":
                 self.ntracks += 1
                 k = self.ntracks - 1
-            self.items.append(VClip(s.media, t0, s.in_s, s.out_s, s.mute, s.vol_db, None, k))
+            elif track is not None and 0 <= track < self.ntracks:
+                k = track
+                for o in sorted((o for o in self.items if o.track == k), key=lambda q: q.t0):
+                    if o.end > at0 and o.t0 < at0 + s.src_dur:
+                        at0 = o.end                             # next free spot on that track
+            else:
+                k = self.free_track(at0, s.src_dur)
+                if k is None:
+                    self.ntracks += 1
+                    k = self.ntracks - 1
+            self.items.append(VClip(s.media, at0, s.in_s, s.out_s, s.mute, s.vol_db, None, k))
             seq.delete(idx)
             self.sel, self.selset = self.items[-1], {self.items[-1]}
             self.changed()
@@ -488,8 +887,8 @@ class VideoTrack(QObject):
         self.eng.pause()
         seq.edit(do)
 
-    def to_base(self, c):
-        """Overlay clip -> main video row (inserted at its start time)."""
+    def to_base(self, c, t=None):
+        """Overlay clip -> main video row (inserted at `t`, default its start time; its position/crop are dropped)."""
         if self.seq.locked & {"video", "video_overlay"}:
             self.seq.blocked.emit("video" if "video" in self.seq.locked else "video_overlay")
             return
@@ -497,15 +896,19 @@ class VideoTrack(QObject):
         def do():
             self.items.remove(c)
             self.sel, self.selset = None, set()
-            self.seq.insert_at(c.t0, Seg(c.media, c.in_s, c.out_s, mute=c.mute, vol_db=c.vol_db))
+            self.seq.insert_at(c.t0 if t is None else max(0.0, t), Seg(c.media, c.in_s, c.out_s, mute=c.mute, vol_db=c.vol_db))
             self.changed()
             return True
         self.eng.pause()
         self.seq.edit(do)
 
-    # ------------------------------------------------------------------ Timeline hooks
-    def drop_files(self, paths, t, k):
-        """Files dropped on overlay row k -> clips on that track (first free spot at/after the drop)."""
+    # ------------------------------------------------------------------ Timeline hooks (strip above the video row)
+    def row_track(self, row):
+        return self.ntracks - 1 - row                          # display row 0 = top = highest track
+
+    def drop_files(self, paths, t, row):
+        """Files dropped on overlay display row `row` -> clips on that track (first free spot at/after the drop)."""
+        k = self.row_track(row)
         before, cur, n = self.begin(), t, 0
         for p in paths:
             m = probing.probe_media(p)
@@ -529,22 +932,20 @@ class VideoTrack(QObject):
         return True
 
     def track_rows(self, tl):
-        return [(f"Video {k + 2}", k * (self.H + 3), self.H) for k in range(self.ntracks)]
+        n = self.ntracks
+        return [(f"Video {self.row_track(r) + 2}", r * (self.H + 3), self.H) for r in range(n)]
 
     def height(self, tl=None):
         return self.ntracks * (self.H + 3) if self.enabled else 0
 
     def _rect(self, tl, c, y):
-        return QRectF(tl.tx(c.t0), y + c.track * (self.H + 3) + 1, max(2.0, c.dur * tl.pps), self.H - 2)
-
-    def _y0(self, tl):
-        return tl.lane_y() + sum(int(l.height(tl)) for l in tl.lanes[:tl.lanes.index(self)])
+        return QRectF(tl.tx(c.t0), y + (self.ntracks - 1 - c.track) * (self.H + 3) + 1, max(2.0, c.dur * tl.pps), self.H - 2)
 
     def paint(self, p, tl, y, W):
         if not self.height(tl):
             return
-        for k in range(self.ntracks):
-            p.fillRect(QRectF(tl.HW, y + k * (self.H + 3), W - tl.HW, self.H), QColor("#181818"))
+        for r in range(self.ntracks):
+            p.fillRect(QRectF(tl.HW, y + r * (self.H + 3), W - tl.HW, self.H), QColor("#181818"))
         fm = p.fontMetrics()
         for c in self.items:
             r = self._rect(tl, c, y)
@@ -563,7 +964,7 @@ class VideoTrack(QObject):
                 p.drawRoundedRect(r, 3, 3)
 
     def _hit(self, pos, tl):
-        y = self._y0(tl)
+        y = tl.strip_y(self)
         for c in self.items:
             r = self._rect(tl, c, y)
             if r.contains(pos):
@@ -576,26 +977,33 @@ class VideoTrack(QObject):
         if c is None:
             return False
         for ln in tl.lanes:
-            if ln is not self:
-                getattr(ln, "clear_sel", lambda t: None)(tl)
+            getattr(ln, "clear_sel", lambda t: None)(tl)
         if tl.atrack:
             tl.atrack.clear_sel(tl)
         self.sel, self.selset, self.drag = c, {c}, None
+        self.sync()
         if e.button() == Qt.MouseButton.RightButton:
             m = QMenu(tl)
             a_opt, a_base = m.addAction("Options..."), m.addAction("Move to main video row")
+            a_rst = m.addAction("Reset position / size / crop")
             a_dup, a_del = m.addAction("Duplicate\tCtrl+D"), m.addAction("Delete")
             act = m.exec(e.globalPosition().toPoint())
             if act is a_opt:
                 self.edit(c)
             elif act is a_base:
                 self.to_base(c)
+            elif act is a_rst:
+                before = self.begin()
+                c.rect, c.crop = None, (0.0, 0.0, 0.0, 0.0)
+                self.changed()
+                self.record(before)
             elif act is a_dup:
                 self.duplicate_key()
             elif act is a_del:
                 self.delete_key()
             return True
         self.drag = (edge or "move", c, e.position().x(), c.t0, c.in_s, c.out_s, self.begin())
+        self._drag_track, self.drop = c.track, None
         return True
 
     def move(self, pos, tl):
@@ -606,8 +1014,12 @@ class VideoTrack(QObject):
         lo, hi = self.limits(c)
         if mode == "move":
             t = max(0.0, tl.snap_span(t0 + dt, c.dur))
-            k = max(0, min(self.ntracks - 1, int((pos.y() - self._y0(tl)) // (self.H + 3))))
-            if k != c.track and self.free_at(k, t, c.dur, ignore=c):     # drag vertically to another overlay track
+            # [52.35] dragging ABOVE the top overlay row = new track on release; dragging DOWN onto the base Video row = move it there
+            self.drop = (("base", t) if pos.y() >= tl.V_Y else ("new", t) if pos.y() < tl.strip_y(self) else None)
+            r = max(0, min(self.ntracks - 1, int((pos.y() - tl.strip_y(self)) // (self.H + 3))))
+            self._ghost(tl, c, pos, t, r)
+            k = self.row_track(r)                              # drag vertically to another overlay track
+            if k != c.track and self.free_at(k, t, c.dur, ignore=c):
                 c.track, c.t0 = k, t
             else:
                 c.t0 = max(lo, min(hi - c.dur, t))
@@ -620,9 +1032,37 @@ class VideoTrack(QObject):
             c.out_s = max(a0 + MIN_V, min(c.media.dur, a0 + e, a0 + (hi - t0)))
         tl._invalidate_content()
 
+    def _ghost(self, tl, c, pos, t, r):
+        """[52.36] Cross-row drag feedback (painted by Timeline.paintEvent): the clip under the mouse + the row it will land on."""
+        W, y0, k = tl.width(), tl.strip_y(self), self.row_track(r)
+        kind = self.drop[0] if self.drop else None
+        alone_top = c.track == self.ntracks - 1 and not any(o is not c and o.track == c.track for o in self.items)
+        if kind == "new":
+            tgt, new, ok = QRectF(tl.HW, y0 - 4, W - tl.HW, 6), True, not alone_top
+        elif kind == "base":
+            tgt, new, ok = QRectF(tl.HW, tl.V_Y, W - tl.HW, tl.V_H), False, True
+        else:
+            tgt, new, ok = QRectF(tl.HW, y0 + r * (self.H + 3), W - tl.HW, self.H), False, (k == c.track or self.free_at(k, t, c.dur, ignore=c))
+        tl.ghost = {"rect": QRectF(tl.tx(t), pos.y() - self.H / 2.0, max(8.0, c.dur * tl.pps), self.H), "target": tgt, "new": new, "ok": ok,
+                    "label": c.media.name, "color": "#7b62b0"}
+
     def release(self, e, tl):
+        tl.ghost = None
         d, self.drag = self.drag, None
+        drop, self.drop = self.drop, None
         if d:
+            c = d[1]
+            if drop and d[0] == "move":
+                kind, t = drop
+                if kind == "base":
+                    c.t0, c.track = d[3], self._drag_track      # back to where it was: to_base records ONE undo step from there
+                    self.changed()
+                    self.to_base(c, t)
+                    return
+                alone_top = c.track == self.ntracks - 1 and not any(o is not c and o.track == c.track for o in self.items)
+                if not alone_top:                               # a lone clip on the top row would just leave an empty row behind
+                    self.ntracks += 1
+                    c.track, c.t0 = self.ntracks - 1, t
             self.changed()
             self.record(d[6])
 
@@ -640,6 +1080,7 @@ class VideoTrack(QObject):
 
     def clear_sel(self, tl):
         self.sel, self.selset = None, set()
+        self.sync()
 
     def snap_points(self):
         return [x for c in self.items for x in (c.t0, c.end)]
@@ -672,7 +1113,7 @@ class VideoTrack(QObject):
         while not self.free_at(c.track, t0, c.dur):
             t0 = min(o.end for o in self.items if o.track == c.track and o.end > t0)
         before = self.begin()
-        n = VClip(c.media, t0, c.in_s, c.out_s, c.mute, c.vol_db, None, c.track)
+        n = VClip(c.media, t0, c.in_s, c.out_s, c.mute, c.vol_db, None, c.track, c.rect, c.crop)
         self.items.append(n)
         self.sel, self.selset = n, {n}
         self.changed()
@@ -681,8 +1122,8 @@ class VideoTrack(QObject):
 
     # ------------------------------------------------------------------ preview
     def _tick(self, _t):
-        if self.items and self.eng.playing:
-            self.sync()
+        if self.items:
+            self.sync()                                       # also while paused/scrubbing so the overlay follows the playhead
 
     def sync(self, *_):
         eng, t = self.eng, self.eng.playhead
@@ -691,10 +1132,12 @@ class VideoTrack(QObject):
             self.layers.append(_Layer(self, len(self.layers)))
         for k, ly in enumerate(self.layers):
             ly.follow(self.at(t, k) if k < n else None, t, bool(eng.playing))
+        self.place()
+        self.refresh_edit()
 
 
 class _Export:
-    """EXPORT_HOOKS entry: composites every overlay clip over the exported video and mixes its audio in."""
+    """EXPORT_HOOKS entry: composites every overlay clip over the exported video (own position/size/crop) and mixes its audio in."""
     def __init__(self, vt):
         self.vt = vt
 
@@ -706,26 +1149,35 @@ class _Export:
         dur = info.dur if info else 0.0
         W, H = (info.w, info.h) if info and info.w and info.h else (1280, 720)
         W, H = W - W % 2, H - H % 2
-        clips = sorted(self.vt.items, key=lambda c: (c.track, c.t0))
+        ev = lambda n: max(2, int(round(n / 2.0)) * 2)
+        clips = sorted(self.vt.items, key=lambda c: (c.track, c.t0))     # higher track composited last = on top
         args, chain, alab = ["-i", src], [], []
         norm = "aresample=48000,aformat=channel_layouts=stereo"
-        if info and info.acodec.strip():
+        base_a = bool(info and info.acodec.strip())
+        if base_a:
             chain.append(f"[0:a]{norm}[a0]")
             alab.append("[a0]")
         cur = "[0:v]"
         for n, c in enumerate(clips, 1):
             args += ["-i", c.media.path]
             t0, t1 = c.t0, c.end
+            x, y, w, h = eff_rect(c, W / float(H))
+            cl, ct, cr, cb = c.crop
+            pw, ph = ev(w * W), ev(h * H)
+            cx, cy = int(round(cl * pw)), int(round(ct * ph))
+            cw, ch = ev(pw * (1 - cl - cr)), ev(ph * (1 - ct - cb))
+            cropf = f",crop={cw}:{ch}:{cx}:{cy}" if any(c.crop) else ""
+            ox, oy = int(round(x * W)) + cx, int(round(y * H)) + cy
             chain.append(f"[{n}:v]trim=start={c.in_s:.3f}:end={c.out_s:.3f},setpts=PTS-STARTPTS+{t0:.3f}/TB,"
-                         f"scale={W}:{H}:force_original_aspect_ratio=decrease,format=yuva420p[o{n}]")
-            chain.append(f"{cur}[o{n}]overlay=x=(W-w)/2:y=(H-h)/2:eof_action=pass:enable='between(t,{t0:.3f},{t1:.3f})'[v{n}]")
+                         f"scale={pw}:{ph}{cropf},format=yuva420p[o{n}]")
+            chain.append(f"{cur}[o{n}]overlay=x={ox}:y={oy}:eof_action=pass:enable='between(t,{t0:.3f},{t1:.3f})'[v{n}]")
             cur = f"[v{n}]"
             if not c.mute and c.media.acodec.strip():
                 ms = int(round(t0 * 1000))
                 chain.append(f"[{n}:a]atrim=start={c.in_s:.3f}:end={c.out_s:.3f},asetpts=PTS-STARTPTS,{norm},"
                              f"volume={c.vol_db:.2f}dB,adelay={ms}|{ms}[a{n}]")
                 alab.append(f"[a{n}]")
-        mix = len(alab) > 1 or (alab and not (info and info.acodec.strip()))
+        mix = len(alab) > 1 or (alab and not base_a)
         if mix:
             chain.append("".join(alab) + f"amix=inputs={len(alab)}:duration=longest:dropout_transition=0:normalize=0[aout]")
         web = ext.lower() == ".webm"
@@ -757,8 +1209,6 @@ class State:
         if self.vt is None:
             self.vt = VideoTrack(self.api.win)
             self.api.win.vtrack_obj = self.vt
-        if self.vt not in tl.lanes:
-            tl.lanes.insert(1, self.vt)                       # right under Linked audio, above the other lanes
         self.vt.set_enabled(True)
         at = getattr(self.api.win, "atrack", None)
         if at is not None:
@@ -767,6 +1217,7 @@ class State:
         self.api.seq.edited.connect(tl.refresh_lanes)         # lane height follows how many audio streams the clips carry
         tl.refresh_lanes()
         self.api.add_dock(self.dock_key, "Properties", PropertiesPanel(self.api))      # part 2
+        self.api.set_export_toggle(True)                      # [52.33] part 4: Video | GIF toggle next to Export
 
     def disable(self):
         if not self.on:
@@ -783,8 +1234,6 @@ class State:
             pass
         if self.vt is not None:
             self.vt.set_enabled(False)                        # hides rows, pauses previews, export hook goes inactive
-            if self.vt in tl.lanes:
-                tl.lanes.remove(self.vt)
         if self.lane in tl.lanes:
             tl.lanes.remove(self.lane)
         at = getattr(self.api.win, "atrack", None)
@@ -793,6 +1242,7 @@ class State:
         tl.set_headers(False)                                 # also clears every lock (normal mode never has hidden locks)
         tl.refresh_lanes()
         self.api.remove_dock(self.dock_key)                   # part 2 (its timers die with the widget)
+        self.api.set_export_toggle(False)                     # part 4
 
 
 def on_load(api):
@@ -808,6 +1258,26 @@ def on_mode_shown(api):
     if S:
         S.enable()
         api.status("Advanced mode: linked audio rows under the video row (right-click > Unlink audio), Properties panel on the right.")
+
+
+def confirm_leave(api):
+    """[52.32] Warn before leaving Advanced (other modes know nothing about its extra tracks). False = stay."""
+    if utils.prefs().value("pref_warn_leave_advanced", True, bool) is False:
+        return True
+    box = QMessageBox(QMessageBox.Icon.Warning, "Leaving Advanced mode",
+                      "Advanced mode features aren't supported by other modes, your project might break.", QMessageBox.StandardButton.NoButton, api.win)
+    leave = box.addButton("Leave Advanced", QMessageBox.ButtonRole.DestructiveRole)
+    stay = box.addButton("Stay", QMessageBox.ButtonRole.AcceptRole)
+    box.setDefaultButton(stay)
+    box.setEscapeButton(stay)
+    cb = QCheckBox("Don't warn me again")
+    box.setCheckBox(cb)
+    box.exec()
+    if box.clickedButton() is leave:
+        if cb.isChecked():
+            utils.prefs().setValue("pref_warn_leave_advanced", False)
+        return True
+    return False
 
 
 def on_mode_hidden(api):

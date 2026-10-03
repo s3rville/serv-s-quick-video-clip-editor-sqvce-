@@ -536,6 +536,10 @@ class VideoStage(QWidget):
                                          # recoverable picture) or "canvas" (drag past it into the
                                          # background - see set_crop_mode / CropOverlay.mouseMoveEvent)
         self.xf = None
+        # [52.30] OVERLAY EDIT TARGET: when an Advanced-mode overlay clip is selected, mods/advanced.py sets `edit_xf` (same 11-tuple
+        # layout as Seg.xf, in DISPLAYED canvas units of the BASE canvas, no rotation) and the three ov_* callbacks. Crop/Resize then edit
+        # THAT clip with this same UI (one set of handles) while rendering (xf/src/fx) still shows the base clip unchanged.
+        self.edit_xf, self.ov_commit, self.ov_reset, self.ov_live = None, None, None, None
         self.src = (0, 0)
         self.pend = None
         self.fx = (0.0, False)          # (rotation deg, mirror) of the current clip
@@ -633,6 +637,9 @@ class VideoStage(QWidget):
             self.b_reset.setText("Confirm")
             return
         self._disarm_reset()
+        if self.edit_xf is not None and self.ov_reset is not None:       # [52.30]
+            self.ov_reset()
+            return
         self.resetRequested.emit()
 
     def _disarm_reset(self):
@@ -713,46 +720,60 @@ class VideoStage(QWidget):
     def scale(self):
         return self._k
 
-    def picture_rect(self):
-        xf = self._eff()
+    def _exf(self):                          # [52.30] xf the Crop/Resize UI EDITS (overlay clip) - else the clip's own
+        return self.edit_xf if self.edit_xf is not None else self._eff()
+
+    def _tr(self):                           # [52.30] render transform; identity when there is no clip (_t() would crash on xf=None)
+        return self._t() if self._eff() else QTransform()
+
+    def _te(self):                           # [52.30] canvas->displayed transform for the edit target (overlays: identity)
+        return QTransform() if self.edit_xf is not None else self._tr()
+
+    def _pic_r(self, xf, t):
         if not xf:
             return QRectF(self._rc)
         _, _, px, py, pw, ph = xf[:6]
         k = self._k
-        d = self._t().mapRect(QRectF(px, py, pw, ph))
+        d = t.mapRect(QRectF(px, py, pw, ph))
         return QRectF(self._rc.x() + d.x() * k, self._rc.y() + d.y() * k, d.width() * k, d.height() * k)
 
-    # [MAP] Screen rect of the persistent clip_rect - the crop window Video-mode edits and Canvas mode
-    # leaves untouched. Same coordinate mapping as picture_rect()/canvas_rect() (see the class docstring's
-    # THREE COORDINATE SPACES) - if that mapping ever changes, update it here too.
-    def clip_rect(self):
-        xf = self._eff()
+    def _clip_r(self, xf, t):
         if not xf:
             return QRectF(self._rc)
         clx, cly, clw, clh = xf_clip(xf)
         k = self._k
-        d = self._t().mapRect(QRectF(clx, cly, clw, clh))
+        d = t.mapRect(QRectF(clx, cly, clw, clh))
         return QRectF(self._rc.x() + d.x() * k, self._rc.y() + d.y() * k, d.width() * k, d.height() * k)
+
+    def picture_rect(self):                  # EDIT target (what CropOverlay draws/drags)
+        return self._pic_r(self._exf(), self._te())
+
+    # [MAP] Screen rect of the persistent clip_rect - the crop window Video-mode edits and Canvas mode
+    # leaves untouched. Same coordinate mapping as picture_rect()/canvas_rect() (see the class docstring's
+    # THREE COORDINATE SPACES) - if that mapping ever changes, update it here too.
+    def clip_rect(self):                     # EDIT target
+        return self._clip_r(self._exf(), self._te())
 
     # [MAP] Screen rect of V = picture INTERSECT clip_rect INTERSECT canvas: the part of the source video
     # that is EVER shown, independent of how big the canvas itself is. Mirrors xf_filter's V in utils.py -
     # if you change one, change the other. Used by relayout() to mask the native video widget so a
     # Canvas-mode resize can never restore (or re-hide) the crop.
     def visible_rect(self):
-        return self.picture_rect().intersected(self.clip_rect()).intersected(self._rc)
+        t = self._tr()
+        return self._pic_r(self._eff(), t).intersected(self._clip_r(self._eff(), t)).intersected(self._rc)   # RENDER (base clip)
 
     # ---- pending (uncommitted) selection, in displayed canvas source-pixel units
     def _cur_units(self):
         if self.pend is not None:
             return QRectF(self.pend)
-        xf = self._eff()
+        xf = self._exf()
         if not xf:
             return QRectF()
         if self.tool == "crop":
             dw, dh = self._disp_dims()
             return QRectF(0, 0, dw, dh)
         _, _, px, py, pw, ph = xf[:6]
-        return self._t().mapRect(QRectF(px, py, pw, ph))
+        return self._te().mapRect(QRectF(px, py, pw, ph))
 
     def pending_sel(self):
         if self.pend is None or self._k <= 0:
@@ -771,7 +792,7 @@ class VideoStage(QWidget):
         self.ed_h.setText(str(int(round(r.height()))))
 
     def _apply_fields(self):
-        xf = self._eff()
+        xf = self._exf()
         if not xf or self.tool is None or not self.bar.isVisible():
             return
         try:
@@ -783,7 +804,7 @@ class VideoStage(QWidget):
         r = self._cur_units()
         if self.tool == "crop" and self.crop_mode == "video":
             _, _, px, py, pw, ph = xf[:6]
-            full = self._t().mapRect(QRectF(px, py, pw, ph))    # full recoverable extent, display units
+            full = self._te().mapRect(QRectF(px, py, pw, ph))    # full recoverable extent, display units
             fx0, fy0 = min(0.0, full.x()), min(0.0, full.y())
             fx1 = max(cw, full.x() + full.width())
             fy1 = max(ch, full.y() + full.height())
@@ -808,11 +829,16 @@ class VideoStage(QWidget):
         self._disarm_reset()
         if self.ed_w.hasFocus() or self.ed_h.hasFocus():
             self._apply_fields()
+        if self.edit_xf is not None and self.ov_commit is not None:      # [52.30] overlay clip: its own commit, base untouched
+            if self.pend is not None:
+                self.ov_commit(self.tool, QRectF(self.pend))
+            self.okClicked.emit()
+            return
         orig_color = xf_color(self.xf) if self.xf else DEFAULT_BG
         # emit on a geometry change OR a color-only change (pend stays None if only the swatch was used)
         if self.pend is not None or self.bg_color != orig_color:
             cur = self.pend if self.pend is not None else self._cur_units()
-            pre = self._t().inverted()[0].mapRect(cur)            # displayed -> pre-rotation units
+            pre = self._te().inverted()[0].mapRect(cur)            # displayed -> pre-rotation units
             k, rc = self._k, self._rc
             self.committed.emit(self.tool, QRectF(rc.x() + pre.x() * k, rc.y() + pre.y() * k,
                                                   pre.width() * k, pre.height() * k), self.bg_color)
@@ -827,6 +853,10 @@ class VideoStage(QWidget):
     def live_picture(self, r):
         k, rc = self._k or 1.0, self._rc
         u = QRectF((r.x() - rc.x()) / k, (r.y() - rc.y()) / k, r.width() / k, r.height() / k)
+        if self.edit_xf is not None:                                      # [52.30] live-scale the OVERLAY clip, not the base
+            if self.ov_live is not None:
+                self.ov_live(u)
+            return
         self._layout_pic(self._t().inverted()[0].mapRect(u))
 
     # [MAP] Central layout routine. Branch 1 - untouched clip (no xf, no tool, no rotation/mirror): everything
@@ -876,7 +906,7 @@ class VideoStage(QWidget):
             self.canvas.setGeometry(rc)
             self._k = rc.width() / dw
             self._rc = QRectF(rc)
-            if editing and self.tool == "crop" and self.crop_mode == "video":
+            if editing and self.tool == "crop" and self.crop_mode == "video" and self.edit_xf is None:
                 # Let a ghost of anything already cropped away show through: widen the native video
                 # widget to the full recoverable picture extent instead of clipping it to the
                 # (already-cropped) clip_rect. self._rc/self._k - the canvas<->screen mapping every
@@ -885,7 +915,7 @@ class VideoStage(QWidget):
                 # bound - equivalent to the old rc.united(picture_rect()) now that clip_rect (not
                 # canvas_rect) is what's being widened away from. Canvas mode never ghosts: clip_rect
                 # doesn't move there, so there's nothing to recover.
-                vrc = self.picture_rect().toRect()
+                vrc = self._pic_r(self._eff(), self._tr()).toRect()
             else:
                 # Normal playback, Resize tool, or Canvas-mode crop editing: mask the video down to
                 # visible_rect() - picture INTERSECT clip_rect INTERSECT canvas - so anything the crop
@@ -897,7 +927,7 @@ class VideoStage(QWidget):
             self.vclip.setGeometry(vrc)
             self.video.setGeometry(0, 0, vrc.width(), vrc.height())
             self.video.setAspectRatioMode(Qt.AspectRatioMode.IgnoreAspectRatio)
-            if editing and self.tool == "resize" and self.pend is not None:
+            if editing and self.tool == "resize" and self.pend is not None and self.edit_xf is None:
                 pic = self._t().inverted()[0].mapRect(self.pend)
             else:
                 pic = QRectF(px, py, pw, ph)
@@ -911,9 +941,10 @@ class VideoStage(QWidget):
         self.overlay.reset_selection()
         self.bar.setVisible(editing)
         if editing:
-            self.b_rot.setVisible(self.tool == "resize")
-            self.b_mode.setVisible(self.tool == "crop")
-            self.b_color.setVisible(self.tool == "crop")   # [FEATURE] no bg-color swatch for Resize
+            ov = self.edit_xf is not None                   # [52.30] overlay clips: no rotate / canvas mode / bg colour
+            self.b_rot.setVisible(self.tool == "resize" and not ov)
+            self.b_mode.setVisible(self.tool == "crop" and not ov)
+            self.b_color.setVisible(self.tool == "crop" and not ov)   # [FEATURE] no bg-color swatch for Resize
             self._sync_fields()
             self.bar.adjustSize()
             self.bar.move(S.width() - self.bar.width() - 10, S.height() - self.bar.height() - 6)

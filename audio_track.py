@@ -33,6 +33,13 @@ def is_audio_media(m):
     return (not m.has_video) or os.path.splitext(m.path)[1].lower() in AUDIO_EXTS
 
 
+def _num(v, lo=-1e12, hi=1e12):
+    """[52.31] Validated finite number from the (untrusted) recovery file, or ValueError."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or not lo <= float(v) <= hi:
+        raise ValueError("bad number")
+    return float(v)
+
+
 class AClip:
     def __init__(self, media, t0, in_s, out_s, mute=False, vol_db=0.0, grp=None, track=0):
         self.id = next(_ids)
@@ -130,6 +137,41 @@ class AudioTrack(QObject):
         export_worker.EXPORT_HOOKS.append(self.hook)
 
     # ------------------------------------------------------------------ history
+    # ---- [52.31] crash recovery (see recovery.py: Recovery._build / _restore). JSON-able dicts; media by project key.
+    def recovery_export(self, key_of):
+        if not self.items:
+            return None
+        return {"ntracks": self.ntracks, "media_keys": sorted({key_of(c.media) for c in self.items}),
+                "items": [{"media": key_of(c.media), "t0": c.t0, "in_s": c.in_s, "out_s": c.out_s, "mute": bool(c.mute),
+                           "vol_db": c.vol_db, "grp": c.grp, "track": c.track} for c in self.items]}
+
+    def recovery_import(self, data, by_path):
+        items = []
+        for d in data.get("items", []):
+            try:
+                m = by_path.get(os.path.abspath(d["media"]))
+                if m is None:
+                    continue
+                a = max(0.0, _num(d["in_s"], 0.0))
+                b = min(_num(d["out_s"], 0.0), m.dur)
+                if b - a < 0.05:
+                    continue
+                g = d.get("grp")
+                c = AClip(m, _num(d["t0"], 0.0), a, b, bool(d.get("mute")), _num(d.get("vol_db", 0.0), -400.0, 400.0),
+                          g if isinstance(g, int) and not isinstance(g, bool) else None, int(_num(d.get("track", 0), 0, 99)))
+                items.append(c)
+            except Exception:
+                continue
+        if not items:
+            return 0
+        self.items, self.sel, self.selset = items, None, set()
+        try:
+            self.ntracks = max(1, int(_num(data.get("ntracks", 1), 1, 99)))
+        except Exception:
+            self.ntracks = 1
+        self.changed()
+        return len(items)
+
     pl = property(lambda s: s.voices[0].pl)                   # [52.26] kept for old callers
 
     def ext_snapshot(self):

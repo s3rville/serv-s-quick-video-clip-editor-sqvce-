@@ -9,6 +9,7 @@
 #   MOD_NAME, MOD_TYPE, MOD_ICON (a glyph, or a png/svg file name inside mods/; tool only), MOD_DESC, MOD_AUTHOR
 #   tool: on_tool_selected(api) / on_tool_deselected(api)     mode: build_mode(api) -> QWidget, on_mode_shown(api)
 #   tab:  build_tab(api) -> QWidget                            any: on_unload(api)
+#   [52.32] Optional mode hook confirm_leave(api): return False to keep the mode (user clicked Stay on a warning).
 #   [52.24] A mode may return the string "editor" from build_mode: it then SHARES the main editor page (no own page) and gets
 #   on_mode_shown(api) when its tab is clicked and on_mode_hidden(api) when the user goes back to Video / GIF or another mode.
 # `api` = ModAPI (win, engine, seq, tl, stage, status(msg), add_dock/remove_dock [52.25], mods_dir). Ticking a mod loads it live; unticking removes its UI and calls
@@ -137,6 +138,13 @@ class ModAPI:
 
     def remove_dock(self, key):
         self.win.remove_mod_dock(key)
+
+    def set_export_toggle(self, on):
+        """[52.33] Show/hide the Video|GIF export toggle next to Export (Advanced-style modes). While shown, the toggle decides
+        which presets + cog are visible and whether Export writes a video or a .gif. Call with False when the mode is left."""
+        f = getattr(self.win, "set_export_kind_toggle", None)
+        if callable(f):
+            f(bool(on))
 
 
 class _StackPopup(QFrame):
@@ -325,7 +333,7 @@ class PluginHost:
         if self.active is info:
             self.deactivate()
         if self.shown is info:
-            self.mode_left()
+            self.mode_left(ask=False)                   # unticked in Preferences: not a user "leave", no confirmation
         self._call(info, "on_unload")
         if info.type == "mode":
             w.titlebar.remove_tab(info.btn)
@@ -345,8 +353,15 @@ class PluginHost:
         self.win.page_stack.setCurrentWidget(info.page)
         self._call(info, "on_mode_shown")
 
-    def mode_left(self):
-        """[52.24] Called when the user leaves a mod mode (MainWindow.request_mode, another mode tab, unticking the mod)."""
+    def mode_left(self, ask=True):
+        """[52.24] Called when the user leaves a mod mode (MainWindow.request_mode, another mode tab, unticking the mod).
+        [52.32] A mode may define confirm_leave(api) -> False to make the user confirm; "Stay" re-selects its tab (the page switch has
+        usually happened already, so the tab is simply clicked again) and on_mode_hidden is NOT called."""
         if self.shown is not None:
-            info, self.shown = self.shown, None
+            info = self.shown
+            if ask and self._call(info, "confirm_leave") is False and getattr(info, "btn", None) is not None:
+                QTimer.singleShot(0, info.btn.click)
+                return False
+            self.shown = None
             self._call(info, "on_mode_hidden")
+        return True

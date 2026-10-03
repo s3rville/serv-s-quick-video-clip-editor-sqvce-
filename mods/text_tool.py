@@ -241,6 +241,11 @@ class State:
         self.changed()
         self.record(b)
 
+    def panel(self, it, on_apply=None):
+        """[52.37] Live-editing widget for ONE item (the Advanced mode's Properties tab embeds it). Edits apply immediately and are
+        recorded as ONE undo step 400 ms after the last change; call .flush() before throwing the widget away."""
+        return TextPanel(it, self, on_apply)
+
     def edit_dialog(self, it):
         self.select(it)
         b = self.begin()
@@ -280,11 +285,32 @@ class State:
 
 # --------------------------------------------------------------------------------------------- timeline lane
 class TextLane:
+    name = "Text"                              # [52.37] row-header label + stable padlock key (Advanced mode headers)
+    lock_key = "text"
+
     def __init__(self, st):
         self.st, self.drag, self.mq, self.mq_base = st, None, None, set()
 
     def height(self, tl):
-        return (self.st.rows * ROW_H + 4) if self.st.items else 0
+        if self.st.items:
+            return self.st.rows * ROW_H + 4
+        return (ROW_H + 4) if tl.headers else 0            # [52.37] Advanced: an empty Text row stays so its "+" is reachable
+
+    # [52.37] Where this lane starts: other lanes (Advanced's linked-audio rows) may sit above it, so tl.lane_y() alone is wrong.
+    # Using it made every hit test / drag / marquee miss the text clips whenever another lane was present.
+    def _y0(self, tl):
+        return tl.lane_y() + sum(int(l.height(tl)) for l in tl.lanes[:tl.lanes.index(self)])
+
+    def track_rows(self, tl):
+        n = max(1, self.st.rows)
+        return [("Text" if n == 1 else f"Text {k + 1}", k * ROW_H, ROW_H) for k in range(n)]
+
+    def add_track(self):
+        """The header "+": a new text clip at the playhead on a NEW layer (layers are never empty - they compact away)."""
+        self.st.add(0.5, 0.5, new_layer=True)
+
+    def remove_track(self, i):
+        self.st.api.status("Text layers disappear on their own when empty - delete or move the clips instead.", 4000)
 
     def sync(self):
         tl = self.st.api.tl
@@ -319,7 +345,7 @@ class TextLane:
             p.drawRect(self.mq)
 
     def _hit(self, pos, tl):
-        y0 = tl.lane_y()
+        y0 = self._y0(tl)
         for it in reversed(self.st.z_items()):
             r = self._rect(tl, it, y0)
             if r.contains(pos):
@@ -345,7 +371,7 @@ class TextLane:
         return True
 
     def marquee(self, r, tl, add):          # called by Timeline's own marquee when it sweeps into the lane
-        y0 = tl.lane_y()
+        y0 = self._y0(tl)
         hit = {i for i in self.st.items if self._rect(tl, i, y0).intersects(r)}
         new = hit | (self.st.selset if add else set())
         if new != self.st.selset:
@@ -390,7 +416,7 @@ class TextLane:
         st = self.st
         if self.mq is not None:
             self.mq = QRectF(self.mq0, QPointF(max(pos.x(), tl.HW), pos.y())).normalized()
-            y0 = tl.lane_y()
+            y0 = self._y0(tl)
             hit = {i for i in st.items if self._rect(tl, i, y0).intersects(self.mq)}
             st.selset, st.sel = hit | self.mq_base, next(iter(hit | self.mq_base), None)
             if st.selset:
@@ -415,11 +441,16 @@ class TextLane:
             if len(orig) == 1:                # vertical drag = change layer (Shift = may open a new one)
                 maxr = max(i.row for i in st.items)
                 shift = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
-                row = int((pos.y() - tl.lane_y()) // ROW_H)
-                row = max(0, min(row, maxr + (1 if shift else 0)))
+                y0 = self._y0(tl)
+                rr = int((pos.y() - y0) // ROW_H)
+                row = max(0, min(rr, maxr + (1 if (shift or rr > maxr) else 0)))   # [52.37] dragging BELOW the last layer opens a new one
+                ok = True
                 if row != r0 and st.limits(row, t0 + dt, t0 + dt + dur, ex) is None:
-                    row = r0                  # the target layer is occupied at that time
+                    row, ok = r0, False       # the target layer is occupied at that time
                 rows[it] = row
+                tl.ghost = {"rect": QRectF(tl.tx(t0 + dt), pos.y() - ROW_H / 2.0, max(8.0, dur * tl.pps), ROW_H - 3),
+                            "target": QRectF(tl.HW, y0 + row * ROW_H, tl.width() - tl.HW, ROW_H), "new": row > maxr, "ok": ok,
+                            "label": "T  " + it.text.replace("\n", " "), "color": "#2f6f5e"}
             lo, hi = -1e18, 1e18              # layers never overlap: clamp against the neighbours (no jumping over)
             for i, o in orig.items():
                 lim = st.limits(rows[i], o[0], o[0] + o[1], ex)
@@ -532,6 +563,7 @@ class TextLane:
 
     def release(self, e, tl):
         d, self.drag, self.mq = self.drag, None, None
+        tl.ghost = None
         tl.setCursor(Qt.CursorShape.ArrowCursor)
         self.st.changed()
         if d:
@@ -972,6 +1004,42 @@ class TextDialog(QDialog):
         w, h = max(w, 0.03), max(h, 0.03)
         it.x, it.y, it.w, it.h = min(x, 1 - w), min(y, 1 - h), w, h
         self.st.changed()
+
+
+class TextPanel(TextDialog):
+    """[52.37] TextDialog living inside a dock (Advanced > Properties): no OK/Cancel, no Esc/Enter closing, edits apply live and are
+    recorded as one undo step after a short pause."""
+    def __init__(self, it, st, on_apply=None):
+        super().__init__(it, st)
+        self.on_apply = on_apply
+        self.setWindowFlags(Qt.WindowType.Widget)
+        self.setModal(False)
+        self.setMinimumWidth(0)
+        for bb in self.findChildren(QDialogButtonBox):
+            bb.hide()
+        self._b = st.begin()
+        self._t = QTimer(self)
+        self._t.setSingleShot(True)
+        self._t.setInterval(400)
+        self._t.timeout.connect(self.flush)
+
+    def showEvent(self, e):
+        QWidget.showEvent(self, e)
+
+    def keyPressEvent(self, e):
+        QWidget.keyPressEvent(self, e)
+
+    def apply(self, *_):
+        super().apply()
+        if hasattr(self, "_t"):
+            self._t.start()
+            if self.on_apply:
+                self.on_apply()
+
+    def flush(self):
+        self._t.stop()
+        self.st.record(self._b)
+        self._b = self.st.begin()
 
 
 # --------------------------------------------------------------------------------------------- export

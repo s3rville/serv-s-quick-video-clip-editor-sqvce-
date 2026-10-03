@@ -937,7 +937,7 @@ class TitleBar(QFrame):
 # Settings are stored via utils.prefs() (pref_* keys); Apply/OK call parent.apply_prefs() (theme + keybinds + mods reload).
 class PreferencesDialog(QDialog):
     PAGES = ("General", "Keybinds", "Interface", "Plug-ins", "Credits")
-    PREF_KEYS = ("pref_export_dir_on", "pref_export_dir", "pref_name_scheme", "pref_keybinds", "pref_theme", "pref_mods_on", "pref_mods_off", "pref_mods_order")
+    PREF_KEYS = ("pref_export_dir_on", "pref_export_dir", "pref_name_scheme", "pref_keybinds", "pref_theme", "pref_mods_on", "pref_mods_off", "pref_mods_order", "pref_warn_leave_advanced")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1222,6 +1222,15 @@ class PreferencesDialog(QDialog):
         if self._check_conflicts():
             QMessageBox.warning(self, "Keybinds", "Two actions share the same shortcut (highlighted in red). Change one first.")
             return False
+        was_on = set(pref_json("pref_mods_on", []))                  # [52.32] newly ticked plug-ins -> recovery caveat
+        now_on = [self.mod_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.mod_list.count())
+                  if self.mod_list.item(i).checkState() == Qt.CheckState.Checked]
+        new_mods = [m for m in now_on if m not in was_on]
+        if new_mods:
+            SB = QMessageBox.StandardButton
+            if QMessageBox.warning(self, "New plug-ins", "Plug-ins may not be fully supported by crash recovery.\n\nNew:\n  " + "\n  ".join(new_mods)
+                                   + "\n\nEnable them anyway?", SB.Ok | SB.Cancel, SB.Ok) != SB.Ok:
+                return False
         s = prefs()
         s.setValue("pref_export_dir_on", self.ex_on.isChecked())
         s.setValue("pref_export_dir", self.ex_dir.text().strip())
